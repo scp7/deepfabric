@@ -69,7 +69,6 @@ class CloudReporter(BaseReporter):
         # Get project ID from config
         self.project_id = config.get("project_id") if config else None
 
-        # Enable cloud reporting if authenticated
         # Enable cloud reporting if authenticated AND experimental flag is set
         is_experimental = get_bool_env("EXPERIMENTAL_DF")
         if not is_experimental:
