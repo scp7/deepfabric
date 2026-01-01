@@ -1,6 +1,6 @@
 [project]
 name = "DeepFabric"
-version = "4.5.1"
+version = "4.6.0"
 description = "Curate High Quality Datasets, Train, Evaluate and Ship"
 authors = [{name = "Luke Hinds", email = "luke@alwaysfurther.ai"}]
 readme = "README.md"
@@ -30,6 +30,7 @@ dependencies = [
     "ollama>=0.6.1",
     "componentize-py>=0.19.3",
     "spin-sdk>=3.4.1",
+    "trl>=0.26.2",
 ]
 
 [project.optional-dependencies]

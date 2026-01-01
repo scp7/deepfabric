@@ -74,9 +74,6 @@ class CloudReporter(BaseReporter):
             config.get("enabled", bool(self.auth_token)) if config else bool(self.auth_token)
         )
 
-
-
-
         # Generate unique run ID for this evaluation
         self.run_id = None  # Will be set when creating run
         self.evaluation_run_id = None  # Backend run ID
@@ -104,11 +101,20 @@ class CloudReporter(BaseReporter):
         try:
             console.print("[cyan]Uploading evaluation results to cloud...[/cyan]")
 
+            # Get model name as string (handle in-memory model objects)
+            model_value = result.config.inference_config.model
+            if isinstance(model_value, str):
+                model_name = model_value
+            else:
+                # For in-memory model objects, extract name from config
+                model_config = getattr(model_value, "config", None)
+                model_name = getattr(model_config, "name_or_path", None) or type(model_value).__name__
+
             # Create evaluation run
             run_data = {
-                "project_id": self.project_id,
+                "pipeline_id": self.project_id,
                 "name": f"Evaluation - {datetime.now(UTC).strftime('%Y-%m-%d %H:%M')}",
-                "model_name": result.config.inference_config.model,
+                "model_name": model_name,
                 "model_provider": result.config.inference_config.backend,
                 "config": {
                     "evaluators": getattr(result.config, "evaluators", ["tool_calling"]),
