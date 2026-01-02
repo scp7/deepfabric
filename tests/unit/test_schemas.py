@@ -466,7 +466,8 @@ class TestMCPToolConversion:
 
         assert tool.name == "get_weather"
         assert tool.description == "Get weather for a location"
-        assert len(tool.parameters) == 2
+        expected_param_count = 2
+        assert len(tool.parameters) == expected_param_count
 
         # Check location parameter (required)
         loc_param = next(p for p in tool.parameters if p.name == "location")
@@ -513,7 +514,8 @@ class TestMCPToolConversion:
 
         assert tool.name == "keywords_data_google_ads_search_volume"
         assert tool.description == "Get search volume data"
-        assert len(tool.parameters) == 4
+        expected_param_count = 4
+        assert len(tool.parameters) == expected_param_count
 
         # All parameters should be optional (not in required list)
         for param in tool.parameters:
@@ -550,7 +552,8 @@ class TestMCPToolConversion:
 
         tool = ToolDefinition.from_mcp(mcp_tool_dict)
 
-        assert len(tool.parameters) == 6
+        expected_param_count = 6
+        assert len(tool.parameters) == expected_param_count
 
         # Check type mappings
         name_param = next(p for p in tool.parameters if p.name == "name")
@@ -606,4 +609,5 @@ class TestMCPToolConversion:
 
         assert tool.name == "no_params_tool"
         assert tool.description == "A tool with no parameters"
-        assert len(tool.parameters) == 0
+        expected_param_count = 0
+        assert len(tool.parameters) == expected_param_count
