@@ -31,7 +31,7 @@ class TestSchemaFramework:
         """Test that expected schemas are available in new modular system."""
         # Check that new modular schemas are in mapping
         assert "basic" in CONVERSATION_SCHEMAS
-        assert "chain_of_thought" in CONVERSATION_SCHEMAS
+        assert "cot" in CONVERSATION_SCHEMAS
 
     def test_get_conversation_schema(self):
         """Test conversation schema retrieval with new modular types."""
@@ -41,18 +41,18 @@ class TestSchemaFramework:
         assert basic_schema is not None
         assert basic_schema == Conversation
 
-        chain_of_thought_schema = get_conversation_schema("chain_of_thought")
-        assert chain_of_thought_schema is not None
-        assert chain_of_thought_schema == Conversation
+        cot_schema = get_conversation_schema("cot")
+        assert cot_schema is not None
+        assert cot_schema == Conversation
 
 
 class TestUnifiedConversationSchema:
     """Test the new unified Conversation schema with capability fields."""
 
-    def test_chain_of_thought_with_reasoning_capability(self):
+    def test_cot_with_reasoning_capability(self):
         """Test Conversation schema with reasoning capability."""
 
-        schema = get_conversation_schema("chain_of_thought")
+        schema = get_conversation_schema("cot")
         assert schema == Conversation
 
         # Create instance with reasoning capability (freetext style)
@@ -76,10 +76,10 @@ class TestUnifiedConversationSchema:
         assert instance.reasoning.style == "freetext"
         assert isinstance(instance.reasoning.content, str)
 
-    def test_chain_of_thought_with_tool_context(self):
+    def test_cot_with_tool_context(self):
         """Test Conversation schema with tool_context capability."""
 
-        schema = get_conversation_schema("chain_of_thought")
+        schema = get_conversation_schema("cot")
         assert schema == Conversation
 
         # Create instance with tool_context capability
@@ -185,7 +185,7 @@ class TestSchemaIntegration:
     def test_conversation_schemas_mapping(self):
         """Test that conversation schemas mapping contains new modular types."""
         # Check that new modular schemas exist
-        expected_schemas = ["basic", "chain_of_thought"]
+        expected_schemas = ["basic", "cot"]
         for schema_type in expected_schemas:
             assert schema_type in CONVERSATION_SCHEMAS
 
@@ -193,7 +193,7 @@ class TestSchemaIntegration:
         """Test schema retrieval for modular types."""
 
         # Test all modular types return unified Conversation schema
-        for schema_type in ["basic", "chain_of_thought"]:
+        for schema_type in ["basic", "cot"]:
             schema = get_conversation_schema(schema_type)
             assert schema is not None
             assert schema == Conversation
