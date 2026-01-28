@@ -101,9 +101,19 @@ async def handle_dataset_events_async(
             if isinstance(event, dict) and "event" in event:
                 if event["event"] == "generation_start":
                     settings = _get_tui_settings()
+                    # Handle both cycle-based and step-based event formats
+                    # Cycle-based: unique_topics, cycles_needed, concurrency
+                    # Step-based: num_steps, batch_size
+                    is_cycle_based = "cycles_needed" in event
+                    if is_cycle_based:
+                        display_steps = event.get("cycles_needed", 1)
+                        display_batch_size = event.get("concurrency", 1)
+                    else:
+                        display_steps = event.get("num_steps", 1)
+                        display_batch_size = event.get("batch_size", 1)
                     # Build header and params panels for layout
                     header_panel, params_panel = tui.build_generation_panels(
-                        event["model_name"], event["num_steps"], event["batch_size"]
+                        event["model_name"], display_steps, display_batch_size
                     )
                     # Capture context for the run
                     tui.root_topic_prompt = event.get("root_topic_prompt")
@@ -112,7 +122,7 @@ async def handle_dataset_events_async(
                     if settings.mode == "rich":
                         # Initialize status tracking
                         tui.init_status(
-                            total_steps=event["num_steps"],
+                            total_steps=display_steps,
                             total_samples=event["total_samples"],
                             checkpoint_enabled=event.get("checkpoint_enabled", False),
                         )
@@ -165,11 +175,12 @@ async def handle_dataset_events_async(
                     else:
                         # Simple/headless mode: print and proceed without Live
                         tui.show_generation_header(
-                            event["model_name"], event["num_steps"], event["batch_size"]
+                            event["model_name"], display_steps, display_batch_size
                         )
                         simple_task = {
                             "count": event.get("resumed_samples", 0),
                             "total": event["total_samples"],
+                            "is_cycle_based": is_cycle_based,
                         }
                 elif event["event"] == "step_complete":
                     samples_generated = event.get("samples_generated", 0)
@@ -213,6 +224,40 @@ async def handle_dataset_events_async(
                     step = int(event.get("step", 0))
                     total = int(event.get("total_steps", 0))
                     tui.status_step_start(step, total)
+
+                elif event["event"] == "cycle_start":
+                    # Cycle-based generation: keep status panel in sync
+                    cycle = int(event.get("cycle", 0))
+                    total_cycles = int(event.get("total_cycles", 0))
+                    tui.status_step_start(cycle, total_cycles)
+
+                elif event["event"] == "cycle_complete":
+                    # Cycle-based generation: update progress
+                    samples_in_cycle = event.get("samples_in_cycle", 0)
+                    failures_in_cycle = event.get("failures_in_cycle", 0)
+                    if footer_prog and task is not None:
+                        if samples_in_cycle > 0:
+                            with contextlib.suppress(Exception):
+                                footer_prog.update(task, advance=samples_in_cycle)
+                            tui.log_event(f"✓ Cycle {event.get('cycle')}: +{samples_in_cycle} samples")
+                            tui.status_step_complete(samples_in_cycle, failures_in_cycle)
+                    elif isinstance(simple_task, dict):
+                        simple_task["count"] += samples_in_cycle
+                        cycle_msg = f"Cycle {event.get('cycle')}: +{samples_in_cycle}"
+                        if failures_in_cycle > 0:
+                            cycle_msg += f" (-{failures_in_cycle} failed)"
+                        cycle_msg += f" (total {simple_task['count']}/{simple_task['total']})"
+
+                        if failures_in_cycle > 0:
+                            tui.warning(cycle_msg)
+                        else:
+                            tui.info(cycle_msg)
+
+                        # Show retry summary if there were retries
+                        retry_summary = tui.get_step_retry_summary()
+                        if retry_summary:
+                            tui.console.print(f"   [dim]{retry_summary}[/dim]")
+                        tui.clear_step_retries()
 
                 elif event["event"] == "checkpoint_saved":
                     # Display checkpoint save notification
