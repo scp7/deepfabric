@@ -1,10 +1,20 @@
 # Generation Model Refactor Plan
 
+## Status: IMPLEMENTED
+
+This refactor has been implemented on branch `fix/generation-byuuid`. See commits:
+- `43ebd47` - feat: add UUID-based topic identification for generation
+- `f44ad09` - wip: checkpoint format v4 with (uuid, cycle) tuples
+- `ebd7739` - feat: implement cycle-based generation with UUID tracking
+- `f144ca4` - feat: add TUI handlers for cycle-based generation events
+
+---
+
 ## Overview
 
 Simplify dataset generation from step-based batching to UUID-based iteration with concurrency control.
 
-## Current Model
+## Previous Model
 
 ```
 num_steps = total_samples / batch_size
@@ -19,289 +29,137 @@ for step in range(num_steps):
 - Cycles topics by multiplying path list
 - Filtering by `topic_id` causes issues with duplicate UUIDs
 
-## New Model
+## New Model (Implemented)
 
-```
-unique_topics = get_unique_topics_by_uuid()  # deduplicated
+```python
+unique_topics = topic_model.get_unique_topics()  # deduplicated by UUID
 cycles_needed = ceil(total_samples / len(unique_topics))
 
 for cycle in range(cycles_needed):
     for topic in unique_topics:
-        if (topic.uuid, cycle) not in completed:
-            await generate_sample(topic)
+        if not _is_completed(topic.uuid, cycle):
+            await generate_sample(topic)  # with semaphore concurrency
             mark_completed(topic.uuid, cycle)
 ```
 
-- Progress: "1234/5000 samples (Cycle 2/3)"
-- Checkpoint tracks `{uuid: cycles_completed}` or `set((uuid, cycle))`
-- No path-based iteration
-- `batch_size` becomes `concurrency` (parallel LLM calls)
+- Progress: "Cycle 2/3: +1875 samples (total 3750/5000)"
+- Checkpoint tracks `completed: list[[uuid, cycle]]` tuples
+- No path-based iteration for cycle calculation
+- `batch_size` controls `concurrency` (parallel LLM calls via asyncio.Semaphore)
 
 ---
 
-## Impact Analysis
+## Implementation Summary
 
-### 1. Topic Models
+### Phase 1: Topic Model Updates (COMPLETE)
 
-#### Graph (deepfabric/graph.py)
-- **Has UUIDs**: Yes, each node has `metadata.uuid`
-- **Change needed**: Add `get_unique_topics()` method returning deduplicated list by UUID
-- **Impact**: Low - structure already supports this
+| File | Changes |
+|------|---------|
+| `topic_model.py` | Added `Topic(uuid, topic)` namedtuple and `get_unique_topics()` abstract method |
+| `graph.py` | Implemented `get_unique_topics()` - deduplicates by node UUID from metadata |
+| `tree.py` | Added `_leaf_uuids` list, `leaf_uuid` field in JSONL, implemented `get_unique_topics()` |
 
-#### Tree (deepfabric/tree.py)
-- **Has UUIDs**: No - currently hashes path content
-- **Change needed**:
-  - Option A: Generate and persist UUIDs when building tree
-  - Option B: Add UUID to leaf nodes in JSONL format
-- **Impact**: Medium - requires format change for new trees, migration for existing
+### Phase 2: Generator Core (COMPLETE)
 
-**Decision needed**: How to handle existing trees without UUIDs?
+| File | Changes |
+|------|---------|
+| `constants.py` | Bumped `CHECKPOINT_VERSION` to 4 |
+| `generator.py` | Changed `_processed_ids: set[str]` to `_completed: set[tuple[str, int]]` |
+| `generator.py` | Added `_prepare_unique_topics()` for cycle calculation |
+| `generator.py` | Added `_run_cycle_based_generation_async()` with asyncio.Semaphore |
+| `generator.py` | Added `_is_completed(uuid, cycle)` and `_is_uuid_completed_any_cycle(uuid)` |
+| `generator.py` | Updated `create_data_async()` and `create_data_with_events_async()` to use cycle-based generation |
 
-### 2. Generator (deepfabric/generator.py)
+### Phase 3: TUI & Event Handlers (COMPLETE)
 
-#### Remove
-- `num_steps` parameter and calculation
-- `_prepare_topic_paths()` cycling logic (path multiplication)
-- Step-based loop (`for step in range(num_steps)`)
-- `_generate_batch_prompts()` with start_idx
-- Step events (`step_start`, `step_complete`)
+| File | Changes |
+|------|---------|
+| `dataset_manager.py` | Added handlers for `cycle_start` and `cycle_complete` events |
+| `dataset_manager.py` | Updated `generation_start` handler to support both cycle-based and step-based formats |
 
-#### Add
-- `concurrency` parameter (rename from `batch_size`)
-- `get_unique_topics()` call on topic model
-- Cycle-aware iteration
-- Semaphore-based concurrency control
-- New progress events (`sample_complete`, `cycle_complete`)
+### Phase 4: Testing (COMPLETE)
 
-#### Modify
-- `_processed_ids` → `_completed` as `dict[str, int]` (uuid → cycles_completed)
-- Checkpoint format to store completion state
-- `_save_checkpoint()` to track by UUID + cycle
-- `load_checkpoint()` to restore UUID completion state
+| File | Changes |
+|------|---------|
+| `test_checkpoint.py` | Updated all tests for v4 checkpoint format with `completed` tuples |
+| `test_checkpoint.py` | Renamed `TestIsTopicProcessed` to `TestIsCompleted` with new method tests |
+| `test_generator.py` | Added `get_unique_topics` mock to topic_tree fixtures |
 
-### 3. CLI (deepfabric/cli.py)
+---
 
-#### `deepfabric validate`
-Current output:
-```
-Total tree paths available: 2750
-Total requested paths: 5000
-```
+## Checkpoint Format
 
-New output:
-```
-Unique topics (by UUID): 1875
-Requested samples: 5000
-Cycles needed: 3 (1875 × 3 = 5625, generating 5000)
-```
-
-#### `deepfabric start`
-- Rename `--batch-size` to `--concurrency` (keep alias for backward compat)
-- Remove step-related options if any
-
-### 4. TUI (deepfabric/tui.py)
-
-#### TUI Rich Mode
-
-Current:
-```
-Step 3/50 [████████░░░░░░░░] 300/5000 samples
-```
-
-New:
-```
-Cycle 2/3 [████████░░░░░░░░] 2100/5000 samples
-Topics: 1875 unique │ Concurrency: 10
-```
-
-Changes:
-- Replace step progress bar with cycle-aware progress
-- Show unique topics count in status panel
-- Update live table to show cycle info instead of step info
-- Update completion summary with cycle stats
-
-#### TUI Simple Mode
-
-Current:
-```
-Step 1: +100 samples (100/5000)
-Step 2: +100 samples (200/5000)
-...
-```
-
-New:
-```
-Starting generation: 5000 samples from 1875 unique topics (3 cycles)
-Cycle 1: 1875/1875 topics ✓
-Cycle 2: 1875/1875 topics ✓
-Cycle 3: 1250/1250 topics ✓ (partial)
-Complete: 5000 samples generated
-```
-
-Changes:
-- Print cycle progress instead of step progress
-- Show partial cycle indicator
-- Periodic sample count updates within cycle (every N samples or every few seconds)
-
-#### Events to Update
-- Remove: `step_start`, `step_complete`
-- Add: `cycle_start`, `cycle_complete`
-- Modify: `generation_start` to include `unique_topics`, `cycles_needed`, `final_cycle_size`
-- Modify: `generation_complete` to include cycle stats
-
-### 5. Dataset Manager (deepfabric/dataset_manager.py)
-
-- Update event handlers for new event types
-- Update `handle_dataset_events_async()` to handle cycle-based progress
-
-### 6. Checkpoint Format
-
-Current (`_checkpoint_metadata.json`):
+### Version 4 (Current)
 ```json
 {
-  "version": "1.0",
-  "processed_ids": ["uuid1", "uuid2", ...],
-  "total_samples": 500,
-  "total_failures": 10
-}
-```
-
-New:
-```json
-{
-  "version": "2.0",
+  "version": 4,
   "completed": [
     ["uuid1", 0],
     ["uuid1", 1],
-    ["uuid2", 0],
-    ...
+    ["uuid2", 0]
   ],
   "total_samples": 500,
   "total_failures": 10,
-  "cycles_needed": 3,
-  "unique_topics": 1875
+  "checkpoint_interval": 100
 }
 ```
 
 Where `completed` is a list of `[uuid, cycle]` tuples (JSON arrays).
 In Python: `self._completed: set[tuple[str, int]]`
 
-### 7. Tree JSONL Format
+### Migration
+- Checkpoints with version < 4 are rejected with clear error message
+- Users must delete old checkpoints and restart
 
-Current:
-```json
-{"path": ["Root", "Branch", "Leaf"]}
-```
+---
 
-New:
+## Tree JSONL Format
+
 ```json
 {"path": ["Root", "Branch", "Leaf"], "leaf_uuid": "550e8400-e29b-41d4-a716-446655440000"}
 ```
 
 - UUID generated at build time using `uuid.uuid4()`
 - Persisted with tree, stable across loads
-- Existing trees without `leaf_uuid` are incompatible (require rebuild)
+- Existing trees without `leaf_uuid` field will error on load
 
 ---
 
-## Migration & Compatibility
+## Event System
 
-### Existing Trees
-- Trees without `leaf_uuid` field are incompatible
-- On load, detect missing UUIDs and raise error with clear message:
-  ```
-  Error: Tree format outdated. Missing leaf_uuid fields.
-  Please rebuild your topic tree with: deepfabric topics build ...
-  ```
+### Cycle-Based Events (New)
+- `cycle_start`: `{cycle, total_cycles, topics_in_cycle}`
+- `cycle_complete`: `{cycle, samples_in_cycle, failures_in_cycle}`
 
-### Existing Checkpoints
-- Version 1.0 checkpoints are incompatible
-- On resume attempt, detect version and refuse:
-  ```
-  Error: Checkpoint format v1.0 is incompatible with current version.
-  Please delete checkpoint and restart: rm -rf .checkpoints/
-  ```
+### Updated Events
+- `generation_start`: Now includes `unique_topics`, `cycles_needed`, `concurrency` when cycle-based
+- `generation_complete`: Includes `cycles_completed`, `unique_topics`
 
 ### Backward Compatibility
-- CLI: `--batch-size` kept as alias for `--concurrency` (deprecated warning)
-- YAML config: `batch_size` still accepted, mapped to `concurrency` internally
-  ```yaml
-  # Old (still works, no warning in config)
-  data_engine:
-    args:
-      batch_size: 100
-
-  # New (preferred)
-  data_engine:
-    args:
-      concurrency: 100
-  ```
-- API: `batch_size` parameter still accepted, mapped to `concurrency`
+- Step-based events (`step_start`, `step_complete`) still emitted when no topic_model provided
+- TUI handles both event types
 
 ---
 
-## Implementation Order
+## Remaining Work (Future)
 
-### Phase 1: Topic Model Updates
-1. Add `get_unique_topics()` to `TopicModel` base class (returns deduplicated by UUID)
-2. Implement in `Graph` - deduplicate by node UUID from metadata
-3. Update `Tree` to generate and persist `leaf_uuid` on build
-4. Update `Tree.save()` to include `leaf_uuid` in JSONL
-5. Update `Tree.from_dict_list()` to load `leaf_uuid` (error if missing)
-6. Implement `get_unique_topics()` in `Tree`
+### CLI Updates (Not Yet Implemented)
+- Add `--concurrency` option as alias for `--batch-size`
+- Update `validate` command to show unique topics and cycles
 
-### Phase 2: Generator Core
-7. Define new checkpoint format v2.0 with `(uuid, cycle)` tuples
-8. Update `load_checkpoint()` to detect v1 and reject with clear error
-9. Replace step loop with cycle-based UUID iteration
-10. Change `_processed_ids: set[str]` → `_completed: set[tuple[str, int]]`
-11. Implement concurrency with `asyncio.Semaphore` (replace batch processing)
-12. Update `_save_checkpoint()` for new format
-13. Remove `_prepare_topic_paths()`, `_generate_batch_prompts()`, step logic
-
-### Phase 3: CLI & Validation
-14. Update `validate` command: show unique UUIDs, cycles needed
-15. Add `--concurrency` option, keep `--batch-size` as deprecated alias (CLI only)
-16. Update config loader: accept both `batch_size` and `concurrency` in YAML (no deprecation warning for config)
-17. Update help text and examples
-
-### Phase 4: TUI Rich Mode
-17. Update `generation_start` handler - show unique topics, cycles
-18. Replace step progress with cycle progress bar
-19. Update live stats panel
-20. Update completion summary with cycle stats
-
-### Phase 5: TUI Simple Mode
-21. Update `generation_start` - print unique topics, cycles info
-22. Replace step output with cycle output
-23. Add periodic progress within cycle (every N samples)
-24. Update completion message
-
-### Phase 6: Event System
-25. Remove events: `step_start`, `step_complete`
-26. Add events: `cycle_start`, `cycle_complete`
-27. Update `generation_start` event payload
-28. Update `generation_complete` event payload
-29. Update `dataset_manager.py` event handlers
-
-### Phase 7: Testing & Cleanup
-30. Update unit tests for new topic model methods
-31. Update generator tests for cycle-based logic
-32. Update TUI tests
-33. Add migration/compatibility tests (v1 checkpoint rejection, old tree rejection)
-34. Remove dead code (step-related functions)
-35. Update documentation
+### Config Updates (Not Yet Implemented)
+- Accept `concurrency` as alias for `batch_size` in YAML config
 
 ---
 
-## Decisions
+## Key Decisions Made
 
 1. **Tree UUIDs**: Generate on build and persist in JSONL
    - New format: `{"path": [...], "leaf_uuid": "..."}`
    - Existing trees require regeneration
 
 2. **Checkpoint migration**: Require fresh start
-   - Detect v1 checkpoint, warn user, refuse to resume
+   - Detect old checkpoint, warn user, refuse to resume
    - User must delete checkpoint or start fresh
 
 3. **Partial cycles**: Track as `(uuid, cycle)` tuples
@@ -309,7 +167,6 @@ New:
    - Cycle 1: 1875 topics, Cycle 2: 1875 topics, Cycle 3: 1250 topics (partial)
    - Checkpoint stores: `{("uuid-abc", 0), ("uuid-abc", 1), ("uuid-def", 0), ...}`
 
-4. **Progress granularity**: Batch updates
-   - Update TUI every N samples or every second (reduce overhead)
-   - Rich mode: live updating progress bar
-   - Simple mode: periodic line output
+4. **Concurrency model**: asyncio.Semaphore
+   - `batch_size` parameter controls maximum parallel LLM calls
+   - Each topic processed independently with semaphore-controlled concurrency
