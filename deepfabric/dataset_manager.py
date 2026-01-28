@@ -185,16 +185,19 @@ async def handle_dataset_events_async(
                     elif isinstance(simple_task, dict):
                         simple_task["count"] += samples_generated
                         failed_in_step = int(event.get("failed_in_step", 0))
+                        topics_exhausted = int(event.get("topics_exhausted", 0))
                         retry_summary = tui.get_step_retry_summary()
 
                         # Build step summary message
                         step_msg = f"Step {event.get('step')}: +{samples_generated}"
                         if failed_in_step > 0:
                             step_msg += f" (-{failed_in_step} failed)"
+                        if topics_exhausted > 0:
+                            step_msg += " [topics exhausted]"
                         step_msg += f" (total {simple_task['count']}/{simple_task['total']})"
 
-                        # Display with appropriate style based on failures
-                        if failed_in_step > 0:
+                        # Display with appropriate style based on failures/exhaustion
+                        if topics_exhausted > 0 or failed_in_step > 0:
                             tui.warning(step_msg)
                         else:
                             tui.info(step_msg)
@@ -250,11 +253,28 @@ async def handle_dataset_events_async(
                         live.stop()
                     tui.console.print()  # Add blank line after live display
                     tui.success(f"Successfully generated {event['total_samples']} samples")
+
+                    # Show accounting summary
+                    expected = event.get("expected_samples", 0)
+                    topics_exhausted = event.get("topics_exhausted", 0)
+                    unaccounted = event.get("unaccounted", 0)
                     tui.log_event(
-                        f"Done • total={event['total_samples']} failed={event['failed_samples']}"
+                        f"Done • expected={expected} generated={event['total_samples']} "
+                        f"failed={event['failed_samples']} topics_exhausted={topics_exhausted} "
+                        f"unaccounted={unaccounted}"
                     )
                     if event["failed_samples"] > 0:
                         tui.warning(f"Failed to generate {event['failed_samples']} samples")
+                    if topics_exhausted > 0:
+                        tui.warning(
+                            f"Topics exhausted: {topics_exhausted} samples could not be generated "
+                            f"(not enough unique topics for requested sample count)"
+                        )
+                    if unaccounted > 0:
+                        tui.error(
+                            f"WARNING: {unaccounted} samples unaccounted for "
+                            f"(neither generated nor recorded as failures)"
+                        )
 
                         # Show detailed failure information in debug mode
                         if debug and engine and hasattr(engine, "failed_samples"):
@@ -548,19 +568,30 @@ def _save_jsonl_without_nulls(dataset: HFDataset, save_path: str) -> None:
             f.write(json.dumps(cleaned, separators=(",", ":")) + "\n")
 
 
-def _save_failed_samples(save_path: str, failed_samples: list, tui) -> None:
-    """Save failed samples to a timestamped file alongside the main dataset.
+def _save_failed_samples(
+    save_path: str,
+    failed_samples: list,
+    tui,
+    use_path_directly: bool = False,
+) -> None:
+    """Save failed samples to a file.
 
     Args:
-        save_path: Path to the main dataset file (e.g., "my-dataset.jsonl")
+        save_path: Path for failures file. If use_path_directly is False, this is treated as the
+                   main dataset path and a timestamped filename is generated alongside it.
         failed_samples: List of failed samples - can be dicts with 'error' and 'raw_content' keys,
                        or plain strings/other types for legacy compatibility
         tui: TUI instance for output
+        use_path_directly: If True, use save_path as-is. If False, generate timestamped filename.
     """
-    # Generate timestamped filename: my-dataset.jsonl -> my-dataset_failures_20231130_143022.jsonl
-    base_path = save_path.rsplit(".", 1)[0] if "." in save_path else save_path
-    timestamp = datetime.now(tz=timezone.utc).strftime("%Y%m%d_%H%M%S")
-    failures_path = f"{base_path}_failures_{timestamp}.jsonl"
+    if use_path_directly:
+        # Use the provided path directly (from --save-failures flag)
+        failures_path = save_path
+    else:
+        # Generate timestamped filename: my-dataset.jsonl -> my-dataset_failures_20231130_143022.jsonl
+        base_path = save_path.rsplit(".", 1)[0] if "." in save_path else save_path
+        timestamp = datetime.now(tz=timezone.utc).strftime("%Y%m%d_%H%M%S")
+        failures_path = f"{base_path}_failures_{timestamp}.jsonl"
 
     try:
         with open(failures_path, "w") as f:
@@ -589,6 +620,7 @@ def save_dataset(
     save_path: str,
     config: DeepFabricConfig | None = None,
     engine: DataSetGenerator | None = None,
+    failures_path: str | None = None,
 ) -> None:
     """
     Save dataset to file.
@@ -598,6 +630,7 @@ def save_dataset(
         save_path: Path where to save the dataset
         config: Optional configuration for upload settings
         engine: Optional DataSetGenerator to save failed samples from
+        failures_path: Optional explicit path for failures file (overrides auto-generated path)
 
     Raises:
         ConfigurationError: If saving fails
@@ -614,7 +647,11 @@ def save_dataset(
         if engine:
             all_failures = engine.get_all_failures()
             if all_failures:
-                _save_failed_samples(save_path, all_failures, tui)
+                # Use explicit failures_path if provided, otherwise auto-generate from save_path
+                actual_failures_path = failures_path or save_path
+                _save_failed_samples(
+                    actual_failures_path, all_failures, tui, use_path_directly=bool(failures_path)
+                )
 
         # Handle automatic uploads if configured
         if config:

@@ -579,8 +579,7 @@ class DataSetGenerator:
 
         self._initialize_checkpoint_paths()
         return (
-            self._checkpoint_metadata_path is not None
-            and self._checkpoint_metadata_path.exists()
+            self._checkpoint_metadata_path is not None and self._checkpoint_metadata_path.exists()
         )
 
     def load_checkpoint(self, retry_failed: bool = False) -> bool:
@@ -766,17 +765,60 @@ class DataSetGenerator:
             topic_paths = topic_model.get_all_paths_with_ids()
             total_paths = len(topic_paths)
             required_samples = num_steps * batch_size
+            logger.info(
+                "Topic preparation: total_paths=%d, required_samples=%d, num_steps=%d, batch_size=%d",
+                total_paths,
+                required_samples,
+                num_steps,
+                batch_size,
+            )
 
             if required_samples > total_paths:
                 # Cycle through topics to generate more samples than paths
                 # Each topic will be used multiple times for even coverage
+                # IMPORTANT: Create unique topic_ids using global index position.
+                # This handles two cases:
+                # 1. Cycling: same path appears multiple times across cycles
+                # 2. Graph duplicates: multiple paths can share the same node topic_id
+                # Using index ensures every position in the list has a unique ID.
                 multiplier = math.ceil(required_samples / total_paths)
-                topic_paths = (topic_paths * multiplier)[:required_samples]
+                cycled_paths: list[TopicPath] = []
+                for cycle in range(multiplier):
+                    for path_idx, tp in enumerate(topic_paths):
+                        if len(cycled_paths) >= required_samples:
+                            break
+                        # Use global index for uniqueness: handles both cycling and graph duplicates
+                        global_idx = len(cycled_paths)
+                        unique_id = f"{tp.topic_id}_idx_{global_idx}"
+                        cycled_paths.append(TopicPath(path=tp.path, topic_id=unique_id))
+                    if len(cycled_paths) >= required_samples:
+                        break
+                topic_paths = cycled_paths
+                logger.info(
+                    "Topics cycled: %d original paths × %d cycles = %d total (trimmed to %d)",
+                    total_paths,
+                    multiplier,
+                    total_paths * multiplier,
+                    len(topic_paths),
+                )
             elif required_samples < total_paths:
                 # Sample subset (percentage case or explicit count < total)
                 # Bandit: not a security function
                 topic_paths = random.sample(topic_paths, required_samples)  # nosec
-            # else: required_samples == total_paths - use all paths as-is
+                # Assign unique IDs to handle graphs with duplicate node IDs
+                topic_paths = [
+                    TopicPath(path=tp.path, topic_id=f"{tp.topic_id}_idx_{idx}")
+                    for idx, tp in enumerate(topic_paths)
+                ]
+            else:
+                # required_samples == total_paths - use all paths but with unique IDs
+                # Graphs can have duplicate topic_ids (multiple paths to same node)
+                topic_paths = [
+                    TopicPath(path=tp.path, topic_id=f"{tp.topic_id}_idx_{idx}")
+                    for idx, tp in enumerate(topic_paths)
+                ]
+
+            logger.info("Topic paths after preparation: %d paths", len(topic_paths))
 
         return topic_paths, num_steps
 
@@ -1050,9 +1092,11 @@ class DataSetGenerator:
         return "malformed_responses"
 
     def summarize_failures(self) -> dict:
-        """Generate a summary of all failures."""
+        """Generate a summary of all failures including those flushed to checkpoint."""
+        # Include both in-memory and flushed failures for accurate total
+        total_failures = self._flushed_failures_count + len(self.failed_samples)
         summary = {
-            "total_failures": len(self.failed_samples),
+            "total_failures": total_failures,
             "failure_types": {k: len(v) for k, v in self.failure_analysis.items()},
             "failure_examples": {},
         }
@@ -1248,6 +1292,17 @@ class DataSetGenerator:
         topic_model_type: str | None = None,
     ) -> AsyncGenerator[dict | HFDataset, None]:
         """Run the main generation loop yielding progress events."""
+        # Verify topic paths cover all expected samples
+        expected_prompts = num_steps * batch_size
+        actual_paths = len(topic_paths) if topic_paths else 0
+        if actual_paths < expected_prompts:
+            logger.warning(
+                "Topic paths (%d) < expected samples (%d). Steps beyond path %d will produce 0 samples.",
+                actual_paths,
+                expected_prompts,
+                actual_paths // batch_size,
+            )
+
         # Initialize checkpoint paths if checkpointing is enabled
         if self.config.checkpoint_interval is not None:
             self._initialize_checkpoint_paths()
@@ -1257,6 +1312,7 @@ class DataSetGenerator:
         samples_in_current_batch: list[dict] = []
         failures_in_current_batch: list[dict] = []
         topic_paths_in_current_batch: list[TopicPath | None] = []
+        topics_exhausted_count = 0  # Samples not generated due to topic exhaustion
 
         try:
             yield {
@@ -1289,6 +1345,29 @@ class DataSetGenerator:
                     data_creation_prompt,
                     num_example_demonstrations,
                 )
+
+                # Handle topic exhaustion - when we've run out of topics
+                if not prompts and topic_paths:
+                    # Topics exhausted - remaining steps will produce nothing
+                    exhausted_in_step = batch_size  # All samples in this batch had no topics
+                    topics_exhausted_count += exhausted_in_step
+                    logger.warning(
+                        "Step %d: Topics exhausted at index %d (only %d topics available for %d expected)",
+                        step + 1,
+                        start_idx,
+                        len(topic_paths),
+                        total_samples,
+                    )
+                    yield {
+                        "event": "step_complete",
+                        "step": step + 1,
+                        "samples_generated": 0,
+                        "success": True,
+                        "failed_in_step": 0,
+                        "failure_reasons": [],
+                        "topics_exhausted": exhausted_in_step,
+                    }
+                    continue
 
                 # Filter out already-processed topics when resuming
                 if self._processed_ids:
@@ -1360,11 +1439,11 @@ class DataSetGenerator:
                         }
                         return  # Exit generator cleanly
 
-                failed_in_batch = len(self.failed_samples) - failed_before
+                # Use new_failures captured BEFORE checkpoint clear, not recalculated after
+                failed_in_batch = len(new_failures)
                 failure_reasons: list[str] = []
-                if failed_in_batch > 0 and self.failed_samples:
-                    recent_failures = self.failed_samples[-failed_in_batch:]
-                    for f in recent_failures[:3]:
+                if failed_in_batch > 0 and new_failures:
+                    for f in new_failures[:3]:
                         if isinstance(f, dict):
                             failure_reasons.append(f.get("error", str(f)))
                         else:
@@ -1403,13 +1482,30 @@ class DataSetGenerator:
                 }
 
             # Calculate total counts including flushed data
-            total_samples = self._flushed_samples_count + len(self._samples)
-            total_failures = self._flushed_failures_count + len(self.failed_samples)
+            actual_samples = self._flushed_samples_count + len(self._samples)
+            actual_failures = self._flushed_failures_count + len(self.failed_samples)
+            total_accounted = actual_samples + actual_failures + topics_exhausted_count
+            true_unaccounted = total_samples - total_accounted
+
+            # Log accounting summary for debugging
+            logger.info(
+                "Generation complete: expected=%d, generated=%d, failed=%d, topics_exhausted=%d, "
+                "accounted=%d, unaccounted=%d",
+                total_samples,  # This is the parameter passed in (expected count)
+                actual_samples,
+                actual_failures,
+                topics_exhausted_count,
+                total_accounted,
+                true_unaccounted,
+            )
 
             yield {
                 "event": "generation_complete",
-                "total_samples": total_samples,
-                "failed_samples": total_failures,
+                "total_samples": actual_samples,
+                "failed_samples": actual_failures,
+                "expected_samples": total_samples,
+                "topics_exhausted": topics_exhausted_count,
+                "unaccounted": true_unaccounted,
             }
 
         except KeyboardInterrupt:
@@ -1464,6 +1560,17 @@ class DataSetGenerator:
                 samples, failed_responses = await self._generate_structured_samples_async(
                     prompts, include_sys_msg, start_sample_idx, topic_paths_for_batch
                 )
+
+                # Verify all prompts are accounted for (no silent drops)
+                accounted = len(samples) + len(failed_responses)
+                if accounted != len(prompts):
+                    logger.warning(
+                        "Sample accounting mismatch: %d prompts, %d samples, %d failures (missing %d)",
+                        len(prompts),
+                        len(samples),
+                        len(failed_responses),
+                        len(prompts) - accounted,
+                    )
 
                 # Update failed samples
                 self.failed_samples.extend(failed_responses)

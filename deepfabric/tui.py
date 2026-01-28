@@ -73,6 +73,13 @@ class TopicBuildingMixin:
         self.events_log.append(f"X {error_event}")
         self._refresh_left()
 
+        # In simple mode with --show-failures, print detailed error immediately
+        if get_tui_settings().mode != "rich" and get_tui_settings().show_failures:
+            self.tui.console.print(f"[red]✗ FAILURE:[/red] {error_event}")
+            if error.message and error.message != error_event:
+                msg = error.message[:200] + "..." if len(error.message) > 200 else error.message
+                self.tui.console.print(f"  [dim]{msg}[/dim]")
+
     def on_step_start(self, step_name: str, metadata: dict[str, Any]) -> None:  # noqa: ARG002
         """Handle step start - topic building doesn't need specific handling."""
         pass
@@ -117,17 +124,19 @@ EVENT_ERROR_MAX_LENGTH = 80  # Max chars for error summaries in events
 class TUISettings:
     mode: str = "rich"  # 'rich' or 'simple'
     syntax: bool = True  # enable syntax highlighting in preview
+    show_failures: bool = False  # show failure details in real-time
 
 
 _tui_settings = TUISettings()
 
 
-def configure_tui(mode: str) -> None:
+def configure_tui(mode: str, show_failures: bool = False) -> None:
     mode = (mode or "rich").lower().strip()
     if mode not in {"rich", "simple"}:
         mode = "rich"
     _tui_settings.mode = mode
     _tui_settings.syntax = mode == "rich"
+    _tui_settings.show_failures = show_failures
 
 
 def get_tui_settings() -> TUISettings:
@@ -1112,7 +1121,8 @@ class DatasetGenerationTUI(StreamObserver):
         if self.checkpoint_enabled:
             if self.checkpoint_count > 0:
                 table.add_row(
-                    "Checkpoints:", f"{self.checkpoint_count} ({self.last_checkpoint_samples} samples)"
+                    "Checkpoints:",
+                    f"{self.checkpoint_count} ({self.last_checkpoint_samples} samples)",
                 )
             else:
                 table.add_row("Checkpoints:", "0 (enabled)")
@@ -1230,6 +1240,14 @@ class DatasetGenerationTUI(StreamObserver):
 
         # Log to events panel with error indicator
         self.log_event(f"X {error_event}")
+
+        # In simple mode with --show-failures, print detailed error immediately
+        if get_tui_settings().mode != "rich" and get_tui_settings().show_failures:
+            self.tui.console.print(f"[red]✗ FAILURE:[/red] {error_event}")
+            if error.message and error.message != error_event:
+                # Show truncated full message if different from event
+                msg = error.message[:200] + "..." if len(error.message) > 200 else error.message
+                self.tui.console.print(f"  [dim]{msg}[/dim]")
 
     def on_retry(
         self,
