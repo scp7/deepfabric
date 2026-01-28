@@ -46,7 +46,7 @@ from .prompts import (
 from .schemas import Conversation, ToolRegistry, get_conversation_schema
 from .tools import BUILTIN_TOOL_REGISTRY
 from .tools.loader import load_tools_from_dict, load_tools_from_endpoint
-from .topic_model import TopicModel, TopicPath
+from .topic_model import Topic, TopicModel, TopicPath
 from .utils import ensure_not_running_loop, get_checkpoint_dir, is_validation_error
 
 # Handle circular import for type hints
@@ -657,18 +657,22 @@ class DataSetGenerator:
                                 failed_ids.add(failure["topic_id"])
                 self._flushed_failures_count = failure_count
 
-            # If retry_failed is True, remove failed IDs from processed set
+            # If retry_failed is True, remove failed UUIDs from completed set
             # so they will be retried during generation
             if retry_failed and failed_ids:
-                ids_to_retry = self._processed_ids & failed_ids
-                self._processed_ids -= ids_to_retry
+                # Remove all (uuid, cycle) tuples for failed UUIDs
+                tuples_to_remove = {
+                    (uuid, cycle) for uuid, cycle in self._completed if uuid in failed_ids
+                }
+                self._completed -= tuples_to_remove
                 # Clear failures file since we're retrying
                 if self._checkpoint_failures_path and self._checkpoint_failures_path.exists():
                     os.remove(self._checkpoint_failures_path)
                 self._flushed_failures_count = 0
                 logger.info(
-                    "Retry mode: %d failed IDs will be retried",
-                    len(ids_to_retry),
+                    "Retry mode: %d failed UUIDs (%d tuples) will be retried",
+                    len(failed_ids),
+                    len(tuples_to_remove),
                 )
 
             logger.info(
@@ -750,6 +754,20 @@ class DataSetGenerator:
         """
         return (uuid, cycle) in self._completed
 
+    def _is_uuid_completed_any_cycle(self, uuid: str) -> bool:
+        """Check if a UUID has been completed in any cycle.
+
+        Used during transition period when step-based generation
+        still needs to check for completed topics.
+
+        Args:
+            uuid: Topic UUID to check
+
+        Returns:
+            True if this UUID has been completed in at least one cycle
+        """
+        return any(u == uuid for u, _cycle in self._completed)
+
     def _validate_create_data_params(
         self,
         num_steps: int,
@@ -798,8 +816,8 @@ class DataSetGenerator:
                 # Using index ensures every position in the list has a unique ID.
                 multiplier = math.ceil(required_samples / total_paths)
                 cycled_paths: list[TopicPath] = []
-                for cycle in range(multiplier):
-                    for path_idx, tp in enumerate(topic_paths):
+                for _cycle in range(multiplier):
+                    for _path_idx, tp in enumerate(topic_paths):
                         if len(cycled_paths) >= required_samples:
                             break
                         # Use global index for uniqueness: handles both cycling and graph duplicates
@@ -836,6 +854,52 @@ class DataSetGenerator:
             logger.info("Topic paths after preparation: %d paths", len(topic_paths))
 
         return topic_paths, num_steps
+
+    def _prepare_unique_topics(
+        self,
+        total_samples: int,
+        topic_model: "TopicModel",
+    ) -> tuple[list[Topic], int]:
+        """Prepare unique topics and calculate cycles needed for generation.
+
+        This method supports the new cycle-based generation model where we iterate
+        over unique topics (by UUID) multiple times (cycles) to generate the
+        requested number of samples.
+
+        Args:
+            total_samples: Total number of samples to generate.
+            topic_model: The topic model (Tree or Graph) to extract topics from.
+
+        Returns:
+            Tuple of (unique_topics, cycles_needed):
+            - unique_topics: List of Topic namedtuples with (uuid, topic)
+            - cycles_needed: Number of times to iterate through all topics
+        """
+        unique_topics = topic_model.get_unique_topics()
+        unique_count = len(unique_topics)
+
+        if unique_count == 0:
+            raise DataSetGeneratorError(
+                "Topic model has no unique topics. Ensure the topic model was built successfully."
+            )
+
+        # Calculate cycles needed to cover the requested samples
+        # e.g., 5000 samples from 1875 topics = ceil(5000/1875) = 3 cycles
+        cycles_needed = math.ceil(total_samples / unique_count)
+
+        # Calculate how many samples we'll generate in the final (partial) cycle
+        final_cycle_size = total_samples - (cycles_needed - 1) * unique_count
+
+        logger.info(
+            "Topic preparation: unique_topics=%d, requested_samples=%d, cycles_needed=%d, "
+            "final_cycle_size=%d",
+            unique_count,
+            total_samples,
+            cycles_needed,
+            final_cycle_size,
+        )
+
+        return unique_topics, cycles_needed
 
     def _generate_batch_prompts(
         self,
@@ -1214,22 +1278,45 @@ class DataSetGenerator:
 
         include_sys_msg = sys_msg if sys_msg is not None else self.config.sys_msg
 
-        topic_paths, num_steps = self._prepare_topic_paths(num_steps, batch_size, topic_model)
-
+        # Calculate total samples requested
         total_samples = num_steps * batch_size
         data_creation_prompt = self._get_cot_prompt_template()
 
         final_result: HFDataset | dict | None = None
-        async for event in self._run_generation_loop_async(
-            num_steps=num_steps,
-            batch_size=batch_size,
-            total_samples=total_samples,
-            topic_paths=topic_paths or [],
-            data_creation_prompt=data_creation_prompt,
-            num_example_demonstrations=num_example_demonstrations,
-            include_sys_msg=include_sys_msg,
-        ):
-            final_result = event
+
+        # Use cycle-based generation when a topic model is provided
+        if topic_model is not None:
+            unique_topics, cycles_needed = self._prepare_unique_topics(
+                total_samples, topic_model
+            )
+
+            # batch_size becomes concurrency in the new model
+            concurrency = batch_size
+
+            async for event in self._run_cycle_based_generation_async(
+                unique_topics=unique_topics,
+                cycles_needed=cycles_needed,
+                total_samples=total_samples,
+                concurrency=concurrency,
+                data_creation_prompt=data_creation_prompt,
+                num_example_demonstrations=num_example_demonstrations,
+                include_sys_msg=include_sys_msg,
+            ):
+                final_result = event
+        else:
+            # Fall back to step-based generation when no topic model
+            topic_paths, num_steps = self._prepare_topic_paths(num_steps, batch_size, topic_model)
+
+            async for event in self._run_generation_loop_async(
+                num_steps=num_steps,
+                batch_size=batch_size,
+                total_samples=total_samples,
+                topic_paths=topic_paths or [],
+                data_creation_prompt=data_creation_prompt,
+                num_example_demonstrations=num_example_demonstrations,
+                include_sys_msg=include_sys_msg,
+            ):
+                final_result = event
 
         if isinstance(final_result, HFDataset):
             trace(
@@ -1270,8 +1357,7 @@ class DataSetGenerator:
 
         include_sys_msg = sys_msg if sys_msg is not None else self.config.sys_msg
 
-        topic_paths, num_steps = self._prepare_topic_paths(num_steps, batch_size, topic_model)
-
+        # Calculate total samples requested
         total_samples = num_steps * batch_size
         data_creation_prompt = self._get_cot_prompt_template()
 
@@ -1281,18 +1367,43 @@ class DataSetGenerator:
             root_topic_prompt = getattr(topic_model, "topic_prompt", None)
             topic_model_type = type(topic_model).__name__.lower()
 
-        async for event in self._run_generation_loop_async(
-            num_steps=num_steps,
-            batch_size=batch_size,
-            total_samples=total_samples,
-            topic_paths=topic_paths or [],
-            data_creation_prompt=data_creation_prompt,
-            num_example_demonstrations=num_example_demonstrations,
-            include_sys_msg=include_sys_msg,
-            root_topic_prompt=root_topic_prompt,
-            topic_model_type=topic_model_type,
-        ):
-            yield event
+        # Use cycle-based generation when a topic model is provided
+        if topic_model is not None:
+            unique_topics, cycles_needed = self._prepare_unique_topics(
+                total_samples, topic_model
+            )
+
+            # batch_size becomes concurrency in the new model
+            concurrency = batch_size
+
+            async for event in self._run_cycle_based_generation_async(
+                unique_topics=unique_topics,
+                cycles_needed=cycles_needed,
+                total_samples=total_samples,
+                concurrency=concurrency,
+                data_creation_prompt=data_creation_prompt,
+                num_example_demonstrations=num_example_demonstrations,
+                include_sys_msg=include_sys_msg,
+                root_topic_prompt=root_topic_prompt,
+                topic_model_type=topic_model_type,
+            ):
+                yield event
+        else:
+            # Fall back to step-based generation when no topic model
+            topic_paths, num_steps = self._prepare_topic_paths(num_steps, batch_size, topic_model)
+
+            async for event in self._run_generation_loop_async(
+                num_steps=num_steps,
+                batch_size=batch_size,
+                total_samples=total_samples,
+                topic_paths=topic_paths or [],
+                data_creation_prompt=data_creation_prompt,
+                num_example_demonstrations=num_example_demonstrations,
+                include_sys_msg=include_sys_msg,
+                root_topic_prompt=root_topic_prompt,
+                topic_model_type=topic_model_type,
+            ):
+                yield event
 
     async def _run_generation_loop_async(  # noqa: PLR0912, PLR0915
         self,
@@ -1338,8 +1449,8 @@ class DataSetGenerator:
                 "total_samples": total_samples,
                 "root_topic_prompt": root_topic_prompt,
                 "topic_model_type": topic_model_type,
-                "resumed_from_checkpoint": len(self._processed_ids) > 0,
-                "previously_processed": len(self._processed_ids),
+                "resumed_from_checkpoint": len(self._completed) > 0,
+                "previously_processed": len(self._completed),
                 "resumed_samples": self._flushed_samples_count,
                 "resumed_failures": self._flushed_failures_count,
                 "checkpoint_enabled": self.config.checkpoint_interval is not None,
@@ -1384,12 +1495,13 @@ class DataSetGenerator:
                     }
                     continue
 
-                # Filter out already-processed topics when resuming
-                if self._processed_ids:
+                # Filter out already-completed topics when resuming
+                if self._completed:
                     filtered_prompts = []
                     filtered_topic_paths: list[TopicPath | None] = []
                     for prompt, tp in zip(prompts, used_topic_paths, strict=False):
-                        if not self._is_topic_processed(tp):
+                        # Check if this topic_id has been completed in any cycle
+                        if tp is None or not self._is_uuid_completed_any_cycle(tp.topic_id):
                             filtered_prompts.append(prompt)
                             filtered_topic_paths.append(tp)
 
@@ -1429,10 +1541,14 @@ class DataSetGenerator:
                     self.config.checkpoint_interval is not None
                     and samples_since_checkpoint >= self.config.checkpoint_interval
                 ):
+                    # Convert topic_paths to (uuid, cycle) tuples (cycle=0 for step-based)
+                    completed_items = [
+                        (tp.topic_id, 0) for tp in topic_paths_in_current_batch if tp is not None
+                    ]
                     self._save_checkpoint(
                         samples_in_current_batch,
                         failures_in_current_batch,
-                        topic_paths_in_current_batch,
+                        completed_items,
                     )
                     samples_in_current_batch = []
                     failures_in_current_batch = []
@@ -1484,10 +1600,13 @@ class DataSetGenerator:
             if self.config.checkpoint_interval is not None and (
                 samples_in_current_batch or failures_in_current_batch
             ):
+                completed_items = [
+                    (tp.topic_id, 0) for tp in topic_paths_in_current_batch if tp is not None
+                ]
                 self._save_checkpoint(
                     samples_in_current_batch,
                     failures_in_current_batch,
-                    topic_paths_in_current_batch,
+                    completed_items,
                 )
                 yield {
                     "event": "checkpoint_saved",
@@ -1528,10 +1647,13 @@ class DataSetGenerator:
             if self.config.checkpoint_interval is not None and (
                 samples_in_current_batch or failures_in_current_batch
             ):
+                completed_items = [
+                    (tp.topic_id, 0) for tp in topic_paths_in_current_batch if tp is not None
+                ]
                 self._save_checkpoint(
                     samples_in_current_batch,
                     failures_in_current_batch,
-                    topic_paths_in_current_batch,
+                    completed_items,
                 )
             yield {
                 "event": "generation_interrupted",
@@ -1545,10 +1667,293 @@ class DataSetGenerator:
             if self.config.checkpoint_interval is not None and (
                 samples_in_current_batch or failures_in_current_batch
             ):
+                completed_items = [
+                    (tp.topic_id, 0) for tp in topic_paths_in_current_batch if tp is not None
+                ]
                 self._save_checkpoint(
                     samples_in_current_batch,
                     failures_in_current_batch,
-                    topic_paths_in_current_batch,
+                    completed_items,
+                )
+            yield {"event": "generation_error", "error": str(e)}
+            self.print_failure_summary()
+            self._save_samples_to_file(ERROR_DATASET_FILENAME)
+            raise DataSetGeneratorError("failed") from e
+
+        # Build final dataset: if samples were flushed to disk, load them from checkpoint
+        if self._flushed_samples_count > 0:
+            all_samples = self._load_all_samples_from_checkpoint()
+            yield HFDataset.from_list(all_samples) if all_samples else HFDataset.from_list([])
+        else:
+            yield (HFDataset.from_list(self._samples) if self._samples else HFDataset.from_list([]))
+
+    async def _run_cycle_based_generation_async(  # noqa: PLR0912, PLR0915
+        self,
+        unique_topics: list[Topic],
+        cycles_needed: int,
+        total_samples: int,
+        concurrency: int,
+        data_creation_prompt: str,
+        num_example_demonstrations: int,
+        include_sys_msg: bool,
+        root_topic_prompt: str | None = None,
+        topic_model_type: str | None = None,
+    ) -> AsyncGenerator[dict | HFDataset, None]:
+        """Run cycle-based generation loop yielding progress events.
+
+        This is the new generation model that iterates over unique topics (by UUID)
+        for multiple cycles, rather than the old step-based batching approach.
+
+        Args:
+            unique_topics: List of Topic namedtuples with (uuid, topic).
+            cycles_needed: Number of cycles to iterate through topics.
+            total_samples: Total number of samples to generate.
+            concurrency: Maximum parallel LLM calls (semaphore limit).
+            data_creation_prompt: The prompt template for data creation.
+            num_example_demonstrations: Number of example demonstrations to include.
+            include_sys_msg: Whether to include system message in output.
+            root_topic_prompt: Original topic prompt for display.
+            topic_model_type: Type of topic model (tree, graph) for display.
+
+        Yields:
+            Progress event dicts and final HFDataset.
+        """
+        unique_topic_count = len(unique_topics)
+        final_cycle_size = total_samples - (cycles_needed - 1) * unique_topic_count
+
+        # Initialize checkpoint paths if checkpointing is enabled
+        if self.config.checkpoint_interval is not None:
+            self._initialize_checkpoint_paths()
+
+        # Track samples for checkpointing
+        samples_since_checkpoint = 0
+        pending_samples: list[dict] = []
+        pending_failures: list[dict] = []
+        pending_completed: list[tuple[str, int]] = []
+        samples_generated = 0
+
+        # Create semaphore for concurrency control
+        semaphore = asyncio.Semaphore(concurrency)
+
+        try:
+            yield {
+                "event": "generation_start",
+                "model_name": self.model_name,
+                "unique_topics": unique_topic_count,
+                "cycles_needed": cycles_needed,
+                "final_cycle_size": final_cycle_size,
+                "concurrency": concurrency,
+                "total_samples": total_samples,
+                "root_topic_prompt": root_topic_prompt,
+                "topic_model_type": topic_model_type,
+                "resumed_from_checkpoint": len(self._completed) > 0,
+                "previously_completed": len(self._completed),
+                "resumed_samples": self._flushed_samples_count,
+                "resumed_failures": self._flushed_failures_count,
+                "checkpoint_enabled": self.config.checkpoint_interval is not None,
+            }
+
+            for cycle in range(cycles_needed):
+                # Determine how many topics to process in this cycle
+                if cycle == cycles_needed - 1:
+                    # Final cycle may be partial
+                    topics_in_cycle = min(final_cycle_size, unique_topic_count)
+                else:
+                    topics_in_cycle = unique_topic_count
+
+                yield {
+                    "event": "cycle_start",
+                    "cycle": cycle + 1,
+                    "total_cycles": cycles_needed,
+                    "topics_in_cycle": topics_in_cycle,
+                }
+
+                # Collect topics to process in this cycle
+                topics_to_process: list[Topic] = []
+                for topic_idx, topic in enumerate(unique_topics):
+                    if cycle == cycles_needed - 1 and topic_idx >= final_cycle_size:
+                        break  # Partial final cycle - stop early
+
+                    if not self._is_completed(topic.uuid, cycle):
+                        topics_to_process.append(topic)
+
+                if not topics_to_process:
+                    # All topics in this cycle already completed (resume scenario)
+                    yield {
+                        "event": "cycle_complete",
+                        "cycle": cycle + 1,
+                        "samples_in_cycle": 0,
+                        "skipped": topics_in_cycle,
+                    }
+                    continue
+
+                # Process topics with concurrency control
+                cycle_samples = 0
+                cycle_failures = 0
+
+                async def process_topic(
+                    topic: Topic, cycle_num: int, sample_idx: int
+                ) -> tuple[list[dict], list[dict], tuple[str, int], bool, int]:
+                    """Process a single topic with semaphore-controlled concurrency.
+
+                    Returns:
+                        Tuple of (new_samples, new_failures, completed_item, success, count)
+                    """
+                    async with semaphore:
+                        # Build prompt for this topic
+                        sample_prompt = self.build_prompt(
+                            data_creation_prompt=data_creation_prompt,
+                            num_example_demonstrations=num_example_demonstrations,
+                            subtopics_list=[topic.topic],  # Use topic text as single-item list
+                        )
+
+                        failed_before = len(self.failed_samples)
+                        samples_before = len(self._samples)
+
+                        # Use existing batch processing for a single sample
+                        topic_path = TopicPath(path=[topic.topic], topic_id=topic.uuid)
+                        success, count = await self._process_batch_with_retries_async(
+                            prompts=[sample_prompt],
+                            include_sys_msg=include_sys_msg,
+                            start_sample_idx=sample_idx,
+                            topic_paths_for_batch=[topic_path],
+                        )
+
+                        # Capture new samples and failures
+                        new_samples = list(self._samples[samples_before:])
+                        new_failures = list(self.failed_samples[failed_before:])
+                        completed_item = (topic.uuid, cycle_num)
+
+                        return new_samples, new_failures, completed_item, success, count
+
+                # Process topics in batches for checkpoint saving
+                for batch_start in range(0, len(topics_to_process), concurrency):
+                    batch_end = min(batch_start + concurrency, len(topics_to_process))
+                    batch_topics = topics_to_process[batch_start:batch_end]
+
+                    # Create and run tasks for this batch
+                    # Pass current samples_generated as starting index for each task
+                    tasks = [
+                        asyncio.create_task(
+                            process_topic(topic, cycle, samples_generated + i)
+                        )
+                        for i, topic in enumerate(batch_topics)
+                    ]
+                    results = await asyncio.gather(*tasks)
+
+                    # Collect results from this batch
+                    for new_samples, new_failures, completed_item, success, count in results:
+                        pending_samples.extend(new_samples)
+                        pending_failures.extend(new_failures)
+                        pending_completed.append(completed_item)
+
+                        if success:
+                            cycle_samples += count
+                            samples_generated += count
+                        else:
+                            cycle_failures += 1
+
+                        samples_since_checkpoint += 1
+
+                    # Save checkpoint if we've reached the interval
+                    if (
+                        self.config.checkpoint_interval is not None
+                        and samples_since_checkpoint >= self.config.checkpoint_interval
+                    ):
+                        self._save_checkpoint(
+                            pending_samples,
+                            pending_failures,
+                            pending_completed,
+                        )
+                        pending_samples = []
+                        pending_failures = []
+                        pending_completed = []
+                        samples_since_checkpoint = 0
+                        yield {
+                            "event": "checkpoint_saved",
+                            "total_samples": self._flushed_samples_count,
+                            "total_failures": self._flushed_failures_count,
+                        }
+
+                        # Check for graceful stop request
+                        if self.stop_requested:
+                            yield {
+                                "event": "generation_stopped",
+                                "message": "Stopped at checkpoint as requested",
+                                "total_samples": self._flushed_samples_count,
+                                "total_failures": self._flushed_failures_count,
+                            }
+                            return
+
+                yield {
+                    "event": "cycle_complete",
+                    "cycle": cycle + 1,
+                    "samples_in_cycle": cycle_samples,
+                    "failures_in_cycle": cycle_failures,
+                }
+
+            # Save final checkpoint with any remaining samples
+            if self.config.checkpoint_interval is not None and (
+                pending_samples or pending_failures
+            ):
+                self._save_checkpoint(
+                    pending_samples,
+                    pending_failures,
+                    pending_completed,
+                )
+                yield {
+                    "event": "checkpoint_saved",
+                    "total_samples": self._flushed_samples_count,
+                    "total_failures": self._flushed_failures_count,
+                    "final": True,
+                }
+
+            # Calculate total counts including flushed data
+            actual_samples = self._flushed_samples_count + len(self._samples)
+            actual_failures = self._flushed_failures_count + len(self.failed_samples)
+
+            logger.info(
+                "Generation complete: expected=%d, generated=%d, failed=%d",
+                total_samples,
+                actual_samples,
+                actual_failures,
+            )
+
+            yield {
+                "event": "generation_complete",
+                "total_samples": actual_samples,
+                "failed_samples": actual_failures,
+                "expected_samples": total_samples,
+                "cycles_completed": cycles_needed,
+                "unique_topics": unique_topic_count,
+            }
+
+        except KeyboardInterrupt:
+            # Save checkpoint on interrupt
+            if self.config.checkpoint_interval is not None and (
+                pending_samples or pending_failures
+            ):
+                self._save_checkpoint(
+                    pending_samples,
+                    pending_failures,
+                    pending_completed,
+                )
+            yield {
+                "event": "generation_interrupted",
+                "message": "Generation interrupted by user.",
+            }
+            self.print_failure_summary()
+            self._save_samples_to_file(INTERRUPTED_DATASET_FILENAME)
+
+        except Exception as e:  # noqa: BLE001
+            # Save checkpoint on error
+            if self.config.checkpoint_interval is not None and (
+                pending_samples or pending_failures
+            ):
+                self._save_checkpoint(
+                    pending_samples,
+                    pending_failures,
+                    pending_completed,
                 )
             yield {"event": "generation_error", "error": str(e)}
             self.print_failure_summary()
