@@ -275,13 +275,16 @@ class DataSetGenerator:
 
         # Checkpoint state
         self._checkpoint_samples_since_save = 0
-        self._processed_ids: set[str] = set()  # Track processed topic IDs (UUIDs)
+        self._completed: set[tuple[str, int]] = set()  # Track (uuid, cycle) tuples
         self._checkpoint_metadata_path: Path | None = None
         self._checkpoint_samples_path: Path | None = None
         self._checkpoint_failures_path: Path | None = None
         # Memory optimization: track flushed counts for checkpoint mode
         self._flushed_samples_count = 0
         self._flushed_failures_count = 0
+        # Generation state for cycle-based iteration
+        self._unique_topics: int = 0  # Number of unique topics
+        self._cycles_needed: int = 0  # Total cycles for requested samples
 
         # Graceful stop flag - set by signal handler to stop at next checkpoint
         self.stop_requested = False
@@ -383,7 +386,7 @@ class DataSetGenerator:
         self,
         new_samples: list[dict],
         new_failures: list[dict],
-        processed_topic_paths: list[TopicPath | None],
+        completed_items: list[tuple[str, int]],
         flush_memory: bool = True,
     ) -> None:
         """Save checkpoint data incrementally.
@@ -391,7 +394,7 @@ class DataSetGenerator:
         Args:
             new_samples: New successful samples to append
             new_failures: New failed samples to append
-            processed_topic_paths: TopicPath objects that were processed in this batch
+            completed_items: List of (uuid, cycle) tuples that were completed
             flush_memory: If True, clear flushed samples from memory (memory optimization)
         """
         if self._checkpoint_samples_path is None:
@@ -409,10 +412,9 @@ class DataSetGenerator:
                 for failure in new_failures:
                     f.write(json.dumps(failure, separators=(",", ":")) + "\n")
 
-        # Track processed topic IDs
-        for topic_path in processed_topic_paths:
-            if topic_path is not None:
-                self._processed_ids.add(topic_path.topic_id)
+        # Track completed (uuid, cycle) tuples
+        for item in completed_items:
+            self._completed.add(item)
 
         # Memory optimization: track flushed counts and clear in-memory lists
         # Must happen BEFORE saving metadata so counts are accurate
@@ -427,10 +429,10 @@ class DataSetGenerator:
         self._save_checkpoint_metadata()
 
         logger.debug(
-            "Checkpoint saved: %d samples, %d failures, %d total IDs processed (flushed=%s)",
+            "Checkpoint saved: %d samples, %d failures, %d completed tuples (flushed=%s)",
             len(new_samples),
             len(new_failures),
-            len(self._processed_ids),
+            len(self._completed),
             flush_memory,
         )
 
@@ -443,6 +445,9 @@ class DataSetGenerator:
         total_samples = self._flushed_samples_count + len(self._samples)
         total_failures = self._flushed_failures_count + len(self.failed_samples)
 
+        # Convert completed set of (uuid, cycle) tuples to list of [uuid, cycle] arrays
+        completed_list = [[uuid, cycle] for uuid, cycle in self._completed]
+
         metadata = {
             "version": CHECKPOINT_VERSION,
             "created_at": datetime.now(timezone.utc).isoformat(),
@@ -452,7 +457,9 @@ class DataSetGenerator:
             "reasoning_style": self.config.reasoning_style,
             "total_samples": total_samples,
             "total_failures": total_failures,
-            "processed_ids": list(self._processed_ids),
+            "completed": completed_list,  # List of [uuid, cycle] arrays
+            "unique_topics": self._unique_topics,
+            "cycles_needed": self._cycles_needed,
             "checkpoint_interval": self.config.checkpoint_interval,
             "topics_file": self.config.topics_file,
         }
@@ -528,12 +535,18 @@ class DataSetGenerator:
         version = metadata.get("version")
         if version is None:
             error_msg = "Missing 'version' field in checkpoint metadata"
-        elif version != CHECKPOINT_VERSION:
-            error_msg = f"Unsupported checkpoint version: {version} (expected {CHECKPOINT_VERSION})"
+        elif version < CHECKPOINT_VERSION:
+            # Old checkpoint format - require fresh start
+            error_msg = (
+                f"Checkpoint format v{version} is incompatible with current version v{CHECKPOINT_VERSION}. "
+                "Please delete the checkpoint and restart: rm -rf .checkpoints/"
+            )
+        elif version > CHECKPOINT_VERSION:
+            error_msg = f"Checkpoint version {version} is newer than supported version {CHECKPOINT_VERSION}"
 
-        # Check required fields
+        # Check required fields for v4 format
         if error_msg is None:
-            required_fields = ["created_at", "total_samples", "processed_ids"]
+            required_fields = ["created_at", "total_samples", "completed", "unique_topics", "cycles_needed"]
             for field in required_fields:
                 if field not in metadata:
                     error_msg = f"Missing required field in checkpoint metadata: {field}"
@@ -613,8 +626,11 @@ class DataSetGenerator:
             # Validate config compatibility
             self._validate_checkpoint_compatibility(metadata)
 
-            # Restore processed IDs
-            self._processed_ids = set(metadata.get("processed_ids", []))
+            # Restore completed (uuid, cycle) tuples
+            completed_list = metadata.get("completed", [])
+            self._completed = {(item[0], item[1]) for item in completed_list}
+            self._unique_topics = metadata.get("unique_topics", 0)
+            self._cycles_needed = metadata.get("cycles_needed", 0)
 
             # Count existing samples (don't load into memory - they're already on disk)
             # Memory optimization: track as flushed counts instead of loading into RAM
@@ -656,10 +672,10 @@ class DataSetGenerator:
                 )
 
             logger.info(
-                "Loaded checkpoint: %d samples, %d failures, %d IDs processed",
+                "Loaded checkpoint: %d samples, %d failures, %d completed (uuid, cycle) tuples",
                 self._flushed_samples_count,
                 self._flushed_failures_count,
-                len(self._processed_ids),
+                len(self._completed),
             )
         except Exception as e:  # noqa: BLE001
             logger.warning("Failed to load checkpoint: %s", e)
@@ -675,7 +691,7 @@ class DataSetGenerator:
             os.remove(self._checkpoint_samples_path)
         if self._checkpoint_failures_path and self._checkpoint_failures_path.exists():
             os.remove(self._checkpoint_failures_path)
-        self._processed_ids.clear()
+        self._completed.clear()
         self._flushed_samples_count = 0
         self._flushed_failures_count = 0
         logger.info("Checkpoint files cleared")
@@ -722,18 +738,17 @@ class DataSetGenerator:
 
         return all_failures
 
-    def _is_topic_processed(self, topic_path: TopicPath | None) -> bool:
-        """Check if a topic has already been processed.
+    def _is_completed(self, uuid: str, cycle: int) -> bool:
+        """Check if a (uuid, cycle) combination has been completed.
 
         Args:
-            topic_path: TopicPath to check
+            uuid: Topic UUID
+            cycle: Cycle number (0-indexed)
 
         Returns:
-            True if topic was already processed in a previous run
+            True if this (uuid, cycle) was already completed
         """
-        if topic_path is None:
-            return False
-        return topic_path.topic_id in self._processed_ids
+        return (uuid, cycle) in self._completed
 
     def _validate_create_data_params(
         self,
