@@ -1295,22 +1295,35 @@ def validate(config_file: str, check_api: bool) -> None:  # noqa: PLR0912
             f"estimated_paths={estimated_paths} ({degree}^{depth})"
         )
 
-        # Output summary with step size and checkpoint info
+        # Output summary with cycle-based generation info
         num_samples = config.output.num_samples
         batch_size = config.output.batch_size
-        # Calculate num_steps - handle 'auto' and percentage strings
-        if isinstance(num_samples, int):
-            num_steps = math.ceil(num_samples / batch_size)
-            output_info = f"Output: num_samples={num_samples}, batch_size={batch_size}, num_steps={num_steps}"
-        else:
-            # For 'auto' or percentage, we can't compute steps without topic count
-            output_info = f"Output: num_samples={num_samples}, batch_size={batch_size}"
 
-        # Add checkpoint info if enabled
+        # Show output configuration
+        output_info = f"Output: num_samples={num_samples}, concurrency={batch_size}"
         if config.output.checkpoint:
             checkpoint = config.output.checkpoint
             output_info += f", checkpoint_interval={checkpoint.interval}"
         tui.info(output_info)
+
+        # Calculate and display cycle-based generation info
+        if isinstance(num_samples, int):
+            cycles_needed = math.ceil(num_samples / estimated_paths)
+            final_cycle_size = num_samples - (cycles_needed - 1) * estimated_paths
+            is_partial = final_cycle_size < estimated_paths
+
+            tui.info(
+                f"  → Cycles needed: {cycles_needed} "
+                f"({num_samples} samples ÷ {estimated_paths} unique topics)"
+            )
+            if is_partial:
+                tui.info(f"  → Final cycle: {final_cycle_size} topics (partial)")
+        else:
+            # For 'auto' or percentage, explain what will happen
+            if num_samples == "auto":
+                tui.info(f"  → Will generate 1 sample per unique topic ({estimated_paths} samples)")
+            else:
+                tui.info(f"  → Samples calculated at runtime based on topic count")
 
         if config.huggingface:
             hf_config = config.get_huggingface_config()
