@@ -107,6 +107,10 @@ async def handle_dataset_events_async(
     simple_progress_task = None
     simple_checkpoint_task = None  # Checkpoint progress task for simple mode
     checkpoint_interval = 0
+    headless_completed = 0  # Counter for non-TTY headless mode
+    headless_total = 0
+    headless_batch_size = 0  # Print threshold for headless mode
+    headless_last_printed = 0  # Last count at which we printed
 
     final_result: HFDataset | None = None
     try:
@@ -131,6 +135,9 @@ async def handle_dataset_events_async(
                         display_batch_size,
                         total_samples=event["total_samples"],
                         is_cycle_based=is_cycle_based,
+                        unique_topics=event.get("unique_topics", 0),
+                        final_cycle_size=event.get("final_cycle_size", 0),
+                        checkpoint_interval=event.get("checkpoint_interval", 0),
                     )
                     # Capture context for the run
                     tui.root_topic_prompt = event.get("root_topic_prompt")
@@ -236,6 +243,7 @@ async def handle_dataset_events_async(
                             if final_cycle and unique and final_cycle < unique:
                                 tui.info(f"  → Final cycle: {final_cycle} topics (partial)")
 
+                        tui.console.print()
                         cp_interval = event.get("checkpoint_interval")
                         if cp_interval and cp_interval > 0:
                             total_cp = math.ceil(prog_total / cp_interval)
@@ -243,6 +251,7 @@ async def handle_dataset_events_async(
                                 f"Checkpoint: every {cp_interval} samples "
                                 f"({total_cp} total checkpoints)"
                             )
+                            tui.console.print()
 
                         if resumed_samples >= prog_total:
                             # Checkpoint already has enough samples
@@ -250,7 +259,7 @@ async def handle_dataset_events_async(
                                 f"Checkpoint already complete: {resumed_samples} samples "
                                 f"(target: {prog_total})"
                             )
-                        else:
+                        elif tui.console.is_terminal:
                             simple_progress = Progress(
                                 SpinnerColumn(),
                                 TextColumn("[progress.description]{task.description}"),
@@ -273,6 +282,13 @@ async def handle_dataset_events_async(
                                     total=checkpoint_interval,
                                     completed=0,
                                 )
+                        else:
+                            # Headless (non-TTY): track progress with counters
+                            headless_total = prog_total
+                            headless_completed = resumed_samples
+                            headless_batch_size = display_batch_size
+                            headless_last_printed = resumed_samples
+                            checkpoint_interval = event.get("checkpoint_interval") or 0
                 elif event["event"] == "step_complete":
                     samples_generated = event.get("samples_generated", 0)
                     if footer_prog and task is not None:
@@ -293,6 +309,14 @@ async def handle_dataset_events_async(
                                     simple_checkpoint_task, advance=samples_generated
                                 )
                         tui.clear_step_retries()
+                    elif headless_total > 0 and samples_generated > 0:
+                        headless_completed += samples_generated
+                        if (
+                            headless_completed - headless_last_printed >= headless_batch_size
+                            or headless_completed >= headless_total
+                        ):
+                            tui.info(f"Generated {headless_completed}/{headless_total} samples")
+                            headless_last_printed = headless_completed
                 elif event["event"] == "step_start":
                     # Keep status panel in sync
                     step = int(event.get("step", 0))
@@ -322,6 +346,14 @@ async def handle_dataset_events_async(
                                 simple_progress.update(
                                     simple_checkpoint_task, advance=batch_generated
                                 )
+                    elif headless_total > 0 and batch_generated > 0:
+                        headless_completed += batch_generated
+                        if (
+                            headless_completed - headless_last_printed >= headless_batch_size
+                            or headless_completed >= headless_total
+                        ):
+                            tui.info(f"Generated {headless_completed}/{headless_total} samples")
+                            headless_last_printed = headless_completed
 
                 elif event["event"] == "cycle_complete":
                     # Cycle-based generation: log cycle summary (progress already advanced by batch_complete)
@@ -333,6 +365,11 @@ async def handle_dataset_events_async(
                             f"+{samples_in_cycle} samples"
                             + (f" (-{failures_in_cycle} failed)" if failures_in_cycle else "")
                         )
+                    elif headless_total > 0:
+                        msg = f"Cycle {event.get('cycle')}: +{samples_in_cycle} samples"
+                        if failures_in_cycle:
+                            msg += f" (-{failures_in_cycle} failed)"
+                        tui.info(msg)
 
                 elif event["event"] == "checkpoint_saved":
                     # Display checkpoint save notification
@@ -353,6 +390,11 @@ async def handle_dataset_events_async(
                                 simple_progress.reset(
                                     simple_checkpoint_task, total=checkpoint_interval
                                 )
+                    elif headless_total > 0:
+                        if is_final:
+                            tui.info(f"Checkpoint (final): {total_samples} samples saved")
+                        else:
+                            tui.info(f"Checkpoint: {total_samples} samples saved")
 
                 elif event["event"] == "generation_stopped":
                     # Graceful stop at checkpoint
@@ -701,7 +743,7 @@ def _save_failed_samples(
         use_path_directly: If True, use save_path as-is. If False, generate timestamped filename.
     """
     if use_path_directly:
-        # Use the provided path directly (from --save-failures flag)
+        # Use the provided path directly
         failures_path = save_path
     else:
         # Generate timestamped filename: my-dataset.jsonl -> my-dataset_failures_20231130_143022.jsonl

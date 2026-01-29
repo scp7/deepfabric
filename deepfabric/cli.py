@@ -525,12 +525,12 @@ def _run_generation(
             if failures_done > 0:
                 tui.info(
                     f"Resuming from checkpoint: {samples_done} samples, "
-                    f"{failures_done} failed, {ids_processed} IDs processed{retry_msg}"
+                    f"{failures_done} failed, {ids_processed} UUIDs processed{retry_msg}"
                 )
             else:
                 tui.info(
                     f"Resuming from checkpoint: {samples_done} samples, "
-                    f"{ids_processed} IDs processed{retry_msg}"
+                    f"{ids_processed} UUIDs processed{retry_msg}"
                 )
         else:
             tui.info("No checkpoint found, starting fresh generation")

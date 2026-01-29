@@ -1,5 +1,6 @@
 import contextlib
 import json
+import math
 import os
 import re
 
@@ -776,6 +777,9 @@ class DatasetGenerationTUI(StreamObserver):
         batch_size: int,
         total_samples: int | None = None,
         is_cycle_based: bool = False,
+        unique_topics: int = 0,
+        final_cycle_size: int = 0,
+        checkpoint_interval: int = 0,
     ) -> tuple[Panel, Panel]:
         """Return header and parameters panels for layout use (no direct printing).
 
@@ -785,36 +789,50 @@ class DatasetGenerationTUI(StreamObserver):
             batch_size: Batch size (step-based) or concurrency (cycle-based).
             total_samples: Explicit total samples count. If None, calculated as num_steps * batch_size.
             is_cycle_based: If True, display "Cycles" and "Concurrency" instead of "Steps" and "Batch Size".
+            unique_topics: Number of unique topics (cycle-based).
+            final_cycle_size: Size of the final cycle (cycle-based).
+            checkpoint_interval: Checkpoint interval in samples.
         """
         header = self.tui.create_header(
             "DeepFabric Dataset Generation",
             f"Creating synthetic traces with {model_name}",
         )
 
-        # Use explicit total_samples if provided, otherwise calculate (for backward compat)
         display_total = total_samples if total_samples is not None else num_steps * batch_size
 
+        lines = [f"[cyan]Model:[/] {model_name}"]
+
         if is_cycle_based:
-            stats = {
-                "Model": model_name,
-                "Cycles": num_steps,
-                "Concurrency": batch_size,
-                "Total Samples": display_total,
-            }
+            lines.append(
+                f"[cyan]Number samples:[/] {display_total}, [cyan]Concurrency:[/] {batch_size}"
+            )
+            cycles_line = (
+                f"[cyan]Cycles needed:[/] {num_steps} "
+                f"({display_total} samples ÷ {unique_topics} unique topics)"
+            )
+            if final_cycle_size and unique_topics and final_cycle_size < unique_topics:
+                cycles_line += f", final cycle: {final_cycle_size} topics (partial)"
+            lines.append(cycles_line)
             log_msg = f"Start • cycles={num_steps} concurrency={batch_size} total={display_total}"
         else:
-            stats = {
-                "Model": model_name,
-                "Steps": num_steps,
-                "Batch Size": batch_size,
-                "Total Samples": display_total,
-            }
+            lines.append(
+                f"[cyan]Number samples:[/] {display_total}, [cyan]Batch size:[/] {batch_size}"
+            )
             log_msg = f"Start • steps={num_steps} batch={batch_size} total={display_total}"
 
-        stats_table = self.tui.create_stats_table(stats)
-        params_panel = Panel(stats_table, title="Generation Parameters", border_style="dim")
+        if checkpoint_interval and checkpoint_interval > 0:
+            total_cp = math.ceil(display_total / checkpoint_interval)
+            lines.append(
+                f"[cyan]Checkpoint:[/] every {checkpoint_interval} samples "
+                f"({total_cp} total checkpoints)"
+            )
 
-        # Seed events log
+        params_panel = Panel(
+            Text.from_markup("\n".join(lines)),
+            title="Generation Parameters",
+            border_style="dim",
+        )
+
         self.events_log.append(log_msg)
         return header, params_panel
 
