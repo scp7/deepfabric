@@ -862,6 +862,7 @@ class DatasetGenerationTUI(StreamObserver):
         self.last_checkpoint_samples = 0
         self._resumed_from_checkpoint = False  # Set by set_checkpoint_resume_status()
         self._stop_requested = False  # Set when graceful stop requested via Ctrl+C
+        self._is_cycle_based = False  # Set by init_status; controls "Cycle" vs "Step" labels
         # Retry tracking for simple mode
         self.step_retries: list[dict] = []  # Retries in current step
 
@@ -881,26 +882,52 @@ class DatasetGenerationTUI(StreamObserver):
         return self.progress
 
     def build_generation_panels(
-        self, model_name: str, num_steps: int, batch_size: int
+        self,
+        model_name: str,
+        num_steps: int,
+        batch_size: int,
+        total_samples: int | None = None,
+        is_cycle_based: bool = False,
     ) -> tuple[Panel, Panel]:
-        """Return header and parameters panels for layout use (no direct printing)."""
+        """Return header and parameters panels for layout use (no direct printing).
+
+        Args:
+            model_name: Name of the LLM model being used.
+            num_steps: Number of steps (step-based) or cycles (cycle-based).
+            batch_size: Batch size (step-based) or concurrency (cycle-based).
+            total_samples: Explicit total samples count. If None, calculated as num_steps * batch_size.
+            is_cycle_based: If True, display "Cycles" and "Concurrency" instead of "Steps" and "Batch Size".
+        """
         header = self.tui.create_header(
             "DeepFabric Dataset Generation",
             f"Creating synthetic traces with {model_name}",
         )
-        stats = {
-            "Model": model_name,
-            "Steps": num_steps,
-            "Batch Size": batch_size,
-            "Total Samples": num_steps * batch_size,
-        }
+
+        # Use explicit total_samples if provided, otherwise calculate (for backward compat)
+        display_total = total_samples if total_samples is not None else num_steps * batch_size
+
+        if is_cycle_based:
+            stats = {
+                "Model": model_name,
+                "Cycles": num_steps,
+                "Concurrency": batch_size,
+                "Total Samples": display_total,
+            }
+            log_msg = f"Start • cycles={num_steps} concurrency={batch_size} total={display_total}"
+        else:
+            stats = {
+                "Model": model_name,
+                "Steps": num_steps,
+                "Batch Size": batch_size,
+                "Total Samples": display_total,
+            }
+            log_msg = f"Start • steps={num_steps} batch={batch_size} total={display_total}"
+
         stats_table = self.tui.create_stats_table(stats)
         params_panel = Panel(stats_table, title="Generation Parameters", border_style="dim")
 
         # Seed events log
-        self.events_log.append(
-            f"Start • steps={num_steps} batch={batch_size} total={num_steps * batch_size}"
-        )
+        self.events_log.append(log_msg)
         return header, params_panel
 
     def on_stream_chunk(self, _source: str, chunk: str, _metadata: dict[str, Any]) -> None:
@@ -1025,8 +1052,17 @@ class DatasetGenerationTUI(StreamObserver):
         self.stream_buffer.clear()
 
     # Deprecated printer retained for backward compatibility
-    def show_generation_header(self, model_name: str, num_steps: int, batch_size: int) -> None:
-        header, params_panel = self.build_generation_panels(model_name, num_steps, batch_size)
+    def show_generation_header(
+        self,
+        model_name: str,
+        num_steps: int,
+        batch_size: int,
+        total_samples: int | None = None,
+        is_cycle_based: bool = False,
+    ) -> None:
+        header, params_panel = self.build_generation_panels(
+            model_name, num_steps, batch_size, total_samples, is_cycle_based
+        )
         self.console.print(header)
         self.console.print(params_panel)
         self.console.print()
@@ -1048,11 +1084,16 @@ class DatasetGenerationTUI(StreamObserver):
 
     # --- Status Panel helpers ---
     def init_status(
-        self, total_steps: int, total_samples: int, checkpoint_enabled: bool = False
+        self,
+        total_steps: int,
+        total_samples: int,
+        checkpoint_enabled: bool = False,
+        is_cycle_based: bool = False,
     ) -> None:
         self.status_total_steps = total_steps
         self.status_total_samples = total_samples
         self.status_current_step = 0
+        self._is_cycle_based = is_cycle_based
         # Preserve samples_done and failed_total if resuming from checkpoint
         if not getattr(self, "_resumed_from_checkpoint", False):
             self.status_samples_done = 0
@@ -1112,9 +1153,11 @@ class DatasetGenerationTUI(StreamObserver):
         table = Table(show_header=False, box=None, padding=(0, 1))
         table.add_column(style="cyan", no_wrap=True)
         table.add_column(style="white")
-        table.add_row("Step:", f"{self.status_current_step}/{self.status_total_steps}")
+        label = "Cycle:" if self._is_cycle_based else "Step:"
+        last_label = "Last Cycle:" if self._is_cycle_based else "Last Step:"
+        table.add_row(label, f"{self.status_current_step}/{self.status_total_steps}")
         if self.status_last_step_duration > 0:
-            table.add_row("Last Step:", f"{self.status_last_step_duration:0.1f}s")
+            table.add_row(last_label, f"{self.status_last_step_duration:0.1f}s")
         table.add_row("Generated:", f"{self.status_samples_done}/{self.status_total_samples}")
         if self.status_failed_total:
             table.add_row("Failed:", str(self.status_failed_total))

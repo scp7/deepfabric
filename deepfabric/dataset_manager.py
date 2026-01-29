@@ -12,6 +12,14 @@ from typing import TYPE_CHECKING, Any
 from datasets import Dataset as HFDataset
 from rich.layout import Layout
 from rich.live import Live
+from rich.progress import (
+    BarColumn,
+    MofNCompleteColumn,
+    Progress,
+    SpinnerColumn,
+    TextColumn,
+    TimeElapsedColumn,
+)
 
 from .config import DeepFabricConfig
 from .config_manager import DEFAULT_MODEL
@@ -93,7 +101,8 @@ async def handle_dataset_events_async(
     footer_prog = None
     task = None
     live = None
-    simple_task = None
+    simple_progress = None  # Progress bar for simple/headless mode
+    simple_progress_task = None
 
     final_result: HFDataset | None = None
     try:
@@ -113,7 +122,11 @@ async def handle_dataset_events_async(
                         display_batch_size = event.get("batch_size", 1)
                     # Build header and params panels for layout
                     header_panel, params_panel = tui.build_generation_panels(
-                        event["model_name"], display_steps, display_batch_size
+                        event["model_name"],
+                        display_steps,
+                        display_batch_size,
+                        total_samples=event["total_samples"],
+                        is_cycle_based=is_cycle_based,
                     )
                     # Capture context for the run
                     tui.root_topic_prompt = event.get("root_topic_prompt")
@@ -125,6 +138,7 @@ async def handle_dataset_events_async(
                             total_steps=display_steps,
                             total_samples=event["total_samples"],
                             checkpoint_enabled=event.get("checkpoint_enabled", False),
+                            is_cycle_based=is_cycle_based,
                         )
 
                         # Build layout with footer card
@@ -154,12 +168,15 @@ async def handle_dataset_events_async(
                         )
                         layout["main"].split_row(left, right)
 
+                        prog_total = event["total_samples"]
+                        resumed_samples = event.get("resumed_samples", 0)
+
                         # Footer run status
                         footer_prog = tui.tui.create_footer(layout, title="Run Status")
                         task = footer_prog.add_task(
                             "Generating dataset samples",
-                            total=event["total_samples"],
-                            completed=event.get("resumed_samples", 0),
+                            total=prog_total,
+                            completed=min(resumed_samples, prog_total),
                         )
 
                         # Use alternate screen to avoid scroll trails; leave a clean terminal
@@ -172,16 +189,44 @@ async def handle_dataset_events_async(
                         tui.live_display = live  # Give TUI reference to update it
                         tui.live_layout = layout  # Allow TUI to update panes
                         live.start()
+                        if resumed_samples >= prog_total:
+                            tui.log_event(
+                                f"Checkpoint already complete: {resumed_samples} samples "
+                                f"(target: {prog_total})"
+                            )
                     else:
-                        # Simple/headless mode: print and proceed without Live
+                        prog_total = event["total_samples"]
+                        resumed_samples = event.get("resumed_samples", 0)
+
+                        # Simple/headless mode: print header then show progress bar
                         tui.show_generation_header(
-                            event["model_name"], display_steps, display_batch_size
+                            event["model_name"],
+                            display_steps,
+                            display_batch_size,
+                            total_samples=prog_total,
+                            is_cycle_based=is_cycle_based,
                         )
-                        simple_task = {
-                            "count": event.get("resumed_samples", 0),
-                            "total": event["total_samples"],
-                            "is_cycle_based": is_cycle_based,
-                        }
+                        if resumed_samples >= prog_total:
+                            # Checkpoint already has enough samples
+                            tui.success(
+                                f"Checkpoint already complete: {resumed_samples} samples "
+                                f"(target: {prog_total})"
+                            )
+                        else:
+                            simple_progress = Progress(
+                                SpinnerColumn(),
+                                TextColumn("[progress.description]{task.description}"),
+                                BarColumn(),
+                                MofNCompleteColumn(),
+                                TimeElapsedColumn(),
+                                console=tui.console,
+                            )
+                            simple_progress_task = simple_progress.add_task(
+                                "Generating",
+                                total=prog_total,
+                                completed=resumed_samples,
+                            )
+                            simple_progress.start()
                 elif event["event"] == "step_complete":
                     samples_generated = event.get("samples_generated", 0)
                     if footer_prog and task is not None:
@@ -193,31 +238,9 @@ async def handle_dataset_events_async(
                             tui.status_step_complete(
                                 samples_generated, int(event.get("failed_in_step", 0))
                             )
-                    elif isinstance(simple_task, dict):
-                        simple_task["count"] += samples_generated
-                        failed_in_step = int(event.get("failed_in_step", 0))
-                        topics_exhausted = int(event.get("topics_exhausted", 0))
-                        retry_summary = tui.get_step_retry_summary()
-
-                        # Build step summary message
-                        step_msg = f"Step {event.get('step')}: +{samples_generated}"
-                        if failed_in_step > 0:
-                            step_msg += f" (-{failed_in_step} failed)"
-                        if topics_exhausted > 0:
-                            step_msg += " [topics exhausted]"
-                        step_msg += f" (total {simple_task['count']}/{simple_task['total']})"
-
-                        # Display with appropriate style based on failures/exhaustion
-                        if topics_exhausted > 0 or failed_in_step > 0:
-                            tui.warning(step_msg)
-                        else:
-                            tui.info(step_msg)
-
-                        # Show retry summary if there were retries
-                        if retry_summary:
-                            tui.console.print(f"   [dim]{retry_summary}[/dim]")
-
-                        # Clear retries for next step
+                    elif simple_progress is not None and simple_progress_task is not None:
+                        with contextlib.suppress(Exception):
+                            simple_progress.update(simple_progress_task, advance=samples_generated)
                         tui.clear_step_retries()
                 elif event["event"] == "step_start":
                     # Keep status panel in sync
@@ -231,33 +254,29 @@ async def handle_dataset_events_async(
                     total_cycles = int(event.get("total_cycles", 0))
                     tui.status_step_start(cycle, total_cycles)
 
+                elif event["event"] == "batch_complete":
+                    # Per-batch progress: advance bars after each concurrency batch
+                    batch_generated = event.get("samples_generated", 0)
+                    batch_failed = event.get("samples_failed", 0)
+                    if footer_prog and task is not None:
+                        if batch_generated > 0:
+                            with contextlib.suppress(Exception):
+                                footer_prog.update(task, advance=batch_generated)
+                            tui.status_step_complete(batch_generated, batch_failed)
+                    elif simple_progress is not None and simple_progress_task is not None:
+                        with contextlib.suppress(Exception):
+                            simple_progress.update(simple_progress_task, advance=batch_generated)
+
                 elif event["event"] == "cycle_complete":
-                    # Cycle-based generation: update progress
+                    # Cycle-based generation: log cycle summary (progress already advanced by batch_complete)
                     samples_in_cycle = event.get("samples_in_cycle", 0)
                     failures_in_cycle = event.get("failures_in_cycle", 0)
                     if footer_prog and task is not None:
-                        if samples_in_cycle > 0:
-                            with contextlib.suppress(Exception):
-                                footer_prog.update(task, advance=samples_in_cycle)
-                            tui.log_event(f"✓ Cycle {event.get('cycle')}: +{samples_in_cycle} samples")
-                            tui.status_step_complete(samples_in_cycle, failures_in_cycle)
-                    elif isinstance(simple_task, dict):
-                        simple_task["count"] += samples_in_cycle
-                        cycle_msg = f"Cycle {event.get('cycle')}: +{samples_in_cycle}"
-                        if failures_in_cycle > 0:
-                            cycle_msg += f" (-{failures_in_cycle} failed)"
-                        cycle_msg += f" (total {simple_task['count']}/{simple_task['total']})"
-
-                        if failures_in_cycle > 0:
-                            tui.warning(cycle_msg)
-                        else:
-                            tui.info(cycle_msg)
-
-                        # Show retry summary if there were retries
-                        retry_summary = tui.get_step_retry_summary()
-                        if retry_summary:
-                            tui.console.print(f"   [dim]{retry_summary}[/dim]")
-                        tui.clear_step_retries()
+                        tui.log_event(
+                            f"✓ Cycle {event.get('cycle')}: "
+                            f"+{samples_in_cycle} samples"
+                            + (f" (-{failures_in_cycle} failed)" if failures_in_cycle else "")
+                        )
 
                 elif event["event"] == "checkpoint_saved":
                     # Display checkpoint save notification
@@ -272,19 +291,21 @@ async def handle_dataset_events_async(
                         else:
                             tui.log_event(f"💾 Checkpoint: {total_samples} samples")
                         tui.status_checkpoint_saved(total_samples)
-                    elif isinstance(simple_task, dict):
-                        # Simple mode: print checkpoint notification
+                    elif simple_progress is not None:
+                        # Simple mode: print checkpoint notification above the bar
                         checkpoint_msg = f"Checkpoint saved: {total_samples} samples"
                         if total_failures > 0:
                             checkpoint_msg += f" ({total_failures} failures)"
                         if is_final:
                             checkpoint_msg = "Final " + checkpoint_msg.lower()
-                        tui.info(checkpoint_msg)
+                        simple_progress.console.print(f"[dim]{checkpoint_msg}[/dim]")
 
                 elif event["event"] == "generation_stopped":
                     # Graceful stop at checkpoint
                     if live:
                         live.stop()
+                    if simple_progress is not None:
+                        simple_progress.stop()
                     tui.console.print()
                     tui.success(
                         f"Gracefully stopped: {event['total_samples']} samples saved to checkpoint"
@@ -296,6 +317,8 @@ async def handle_dataset_events_async(
                 elif event["event"] == "generation_complete":
                     if live:
                         live.stop()
+                    if simple_progress is not None:
+                        simple_progress.stop()
                     tui.console.print()  # Add blank line after live display
                     tui.success(f"Successfully generated {event['total_samples']} samples")
 
@@ -340,6 +363,8 @@ async def handle_dataset_events_async(
     except Exception as e:
         if live:
             live.stop()
+        if simple_progress is not None:
+            simple_progress.stop()
         if debug:
             get_tui().error(f"🔍 Debug: Full traceback:\n{traceback.format_exc()}")
         get_tui().error(f"Dataset generation failed: {str(e)}")
@@ -432,16 +457,21 @@ async def create_dataset_async(
     generation_params = config.get_generation_params(**(generation_overrides or {}))
     final_model = model or generation_params.get("model_name", DEFAULT_MODEL)
 
-    # Convert total samples to number of steps (batches)
-    # The generator expects num_steps where total_samples = num_steps * batch_size
     import math  # noqa: PLC0415
 
-    final_num_steps = math.ceil(final_num_samples / final_batch_size)
+    # Show cycle-based info when topic_model has unique topics
+    unique_topics = topic_model.get_unique_topics()
+    unique_topic_count = len(unique_topics)
+    cycles_needed = math.ceil(final_num_samples / unique_topic_count) if unique_topic_count > 0 else 1
 
+    tui.info(f"Unique topics: {unique_topic_count}")
     tui.info(
-        f"Dataset generation: {final_num_samples} samples in {final_num_steps} steps "
-        f"(batch_size={final_batch_size})"
+        f"Dataset generation: {final_num_samples} samples in {cycles_needed} cycles "
+        f"(concurrency={final_batch_size})"
     )
+
+    # Still compute num_steps for backward compat with the generator's step-based path
+    final_num_steps = math.ceil(final_num_samples / final_batch_size)
 
     # Create progress reporter and attach TUI as observer for streaming feedback
     progress_reporter = ProgressReporter()

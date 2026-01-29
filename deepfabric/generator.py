@@ -1793,11 +1793,16 @@ class DataSetGenerator:
 
                 async def process_topic(
                     topic: Topic, cycle_num: int, sample_idx: int
-                ) -> tuple[list[dict], list[dict], tuple[str, int], bool, int]:
+                ) -> tuple[tuple[str, int], bool, int]:
                     """Process a single topic with semaphore-controlled concurrency.
 
+                    Note: Samples/failures are NOT extracted here because concurrent
+                    tasks share self._samples. Extracting per-task would cause
+                    duplicates since each task's slice overlaps with others.
+                    Instead, samples are captured in bulk after asyncio.gather.
+
                     Returns:
-                        Tuple of (new_samples, new_failures, completed_item, success, count)
+                        Tuple of (completed_item, success, count)
                     """
                     async with semaphore:
                         # Build prompt for this topic
@@ -1806,9 +1811,6 @@ class DataSetGenerator:
                             num_example_demonstrations=num_example_demonstrations,
                             subtopics_list=[topic.topic],  # Use topic text as single-item list
                         )
-
-                        failed_before = len(self.failed_samples)
-                        samples_before = len(self._samples)
 
                         # Use existing batch processing for a single sample
                         topic_path = TopicPath(path=[topic.topic], topic_id=topic.uuid)
@@ -1819,19 +1821,20 @@ class DataSetGenerator:
                             topic_paths_for_batch=[topic_path],
                         )
 
-                        # Capture new samples and failures
-                        new_samples = list(self._samples[samples_before:])
-                        new_failures = list(self.failed_samples[failed_before:])
                         completed_item = (topic.uuid, cycle_num)
-
-                        return new_samples, new_failures, completed_item, success, count
+                        return completed_item, success, count
 
                 # Process topics in batches for checkpoint saving
                 for batch_start in range(0, len(topics_to_process), concurrency):
                     batch_end = min(batch_start + concurrency, len(topics_to_process))
                     batch_topics = topics_to_process[batch_start:batch_end]
 
-                    # Create and run tasks for this batch
+                    # Snapshot list lengths before tasks start so we can
+                    # capture new items in one safe slice after all complete.
+                    samples_before_gather = len(self._samples)
+                    failures_before_gather = len(self.failed_samples)
+
+                    # Create concurrent tasks
                     # Pass current samples_generated as starting index for each task
                     tasks = [
                         asyncio.create_task(
@@ -1839,21 +1842,38 @@ class DataSetGenerator:
                         )
                         for i, topic in enumerate(batch_topics)
                     ]
-                    results = await asyncio.gather(*tasks)
 
-                    # Collect results from this batch
-                    for new_samples, new_failures, completed_item, success, count in results:
-                        pending_samples.extend(new_samples)
-                        pending_failures.extend(new_failures)
+                    # Process results as each task finishes (not waiting for
+                    # the whole batch) so the progress bar advances per-sample.
+                    batch_samples = 0
+                    batch_failures = 0
+                    for future in asyncio.as_completed(tasks):
+                        completed_item, success, count = await future
                         pending_completed.append(completed_item)
 
                         if success:
                             cycle_samples += count
                             samples_generated += count
+                            batch_samples += count
                         else:
                             cycle_failures += 1
+                            batch_failures += 1
 
                         samples_since_checkpoint += 1
+
+                        # Emit per-sample progress so progress bars advance immediately
+                        yield {
+                            "event": "batch_complete",
+                            "samples_generated": count if success else 0,
+                            "samples_failed": 1 if not success else 0,
+                        }
+
+                    # After all tasks complete, capture samples/failures in
+                    # one safe slice (no concurrent tasks are running now).
+                    batch_new_samples = list(self._samples[samples_before_gather:])
+                    batch_new_failures = list(self.failed_samples[failures_before_gather:])
+                    pending_samples.extend(batch_new_samples)
+                    pending_failures.extend(batch_new_failures)
 
                     # Save checkpoint if we've reached the interval
                     if (

@@ -493,7 +493,7 @@ def _run_generation(
         if engine.load_checkpoint(retry_failed=options.retry_failed):
             samples_done = engine._flushed_samples_count
             failures_done = engine._flushed_failures_count
-            ids_processed = len(engine._processed_ids)
+            ids_processed = len(engine._completed)
             retry_msg = " (retrying failed samples)" if options.retry_failed else ""
 
             # Update TUI status panel with checkpoint progress
