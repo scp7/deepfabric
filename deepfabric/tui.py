@@ -3,6 +3,7 @@ import json
 import os
 import re
 
+from abc import abstractmethod
 from collections import deque
 from dataclasses import dataclass
 from time import monotonic
@@ -28,78 +29,6 @@ from .progress import StreamObserver
 
 if TYPE_CHECKING:
     from .error_codes import ClassifiedError
-
-
-class TopicBuildingMixin:
-    """Mixin providing shared functionality for Tree and Graph building TUIs.
-
-    Provides common implementations for:
-    - _refresh_left(): Update events panel in left column
-    - on_error(): Handle error events from progress reporter
-    - on_step_start()/on_step_complete(): No-op handlers for step events
-    - update_status_panel(): Update status panel (requires _status_panel() in subclass)
-
-    Subclasses must have these attributes:
-    - tui: DeepFabricTUI instance
-    - live_display: Live | None
-    - live_layout: Layout | None
-    - events_log: deque
-    """
-
-    tui: "DeepFabricTUI"
-    live_display: "Live | None"
-    live_layout: "Layout | None"
-    events_log: "deque"
-
-    def stop_live(self) -> None:
-        """Stop the Live display if it's running."""
-        if self.live_display:
-            self.live_display.stop()
-            self.live_display = None
-
-    def _refresh_left(self) -> None:
-        """Update events panel in left column."""
-        if self.live_layout is not None:
-            try:
-                self.live_layout["main"]["left"]["events"].update(
-                    self.tui.build_events_panel(list(self.events_log))
-                )
-            except Exception:
-                return
-
-    def on_error(self, error: "ClassifiedError", metadata: dict[str, Any]) -> None:  # noqa: ARG002
-        """Handle error events - log to events panel."""
-        error_event = error.to_event()
-        self.events_log.append(f"X {error_event}")
-        self._refresh_left()
-
-        # In simple mode with --show-failures, print detailed error immediately
-        if get_tui_settings().mode != "rich" and get_tui_settings().show_failures:
-            self.tui.console.print(f"[red]✗ FAILURE:[/red] {error_event}")
-            if error.message and error.message != error_event:
-                msg = error.message[:200] + "..." if len(error.message) > 200 else error.message
-                self.tui.console.print(f"  [dim]{msg}[/dim]")
-
-    def on_step_start(self, step_name: str, metadata: dict[str, Any]) -> None:  # noqa: ARG002
-        """Handle step start - topic building doesn't need specific handling."""
-        pass
-
-    def on_step_complete(self, step_name: str, metadata: dict[str, Any]) -> None:  # noqa: ARG002
-        """Handle step complete - topic building doesn't need specific handling."""
-        pass
-
-    def update_status_panel(self) -> None:
-        """Update the status panel in the right column."""
-        if self.live_layout is None:
-            return
-        try:
-            self.live_layout["main"]["right"]["status"].update(self._status_panel())
-        except Exception:
-            return
-
-    def _status_panel(self) -> Panel:
-        """Create status panel - must be implemented by subclass."""
-        raise NotImplementedError
 
 
 # Constants
@@ -299,44 +228,83 @@ class DeepFabricTUI:
         self.console.print(f"• {message}", style="blue")
 
 
-class TreeBuildingTUI(TopicBuildingMixin, StreamObserver):
-    """TUI for tree building operations with simplified progress and streaming."""
+class TopicGenerationTUI(StreamObserver):
+    """Abstract base for Tree and Graph building TUIs.
+
+    Provides shared initialization, layout setup, streaming, retry handling,
+    and event management. Subclasses customize via template methods.
+
+    Subclasses must implement:
+    - _get_title() -> str
+    - _get_subtitle(model_name) -> str
+    - _get_footer_description() -> str
+    - _topic_model_type() -> str  ('tree' or 'graph')
+    - _status_panel() -> Panel
+    """
 
     def __init__(self, tui: DeepFabricTUI):
         self.tui = tui
         self.console = tui.console
         self.progress = None
         self.overall_task = None
-        self.generated_paths = 0
         self.failed_attempts = 0
-        self.current_depth = 0
-        self.max_depth = 0
         self.stream_buffer = deque(maxlen=2000)
-        self.live_display = None
+        self.live_display: Live | None = None
         self.live_layout: Layout | None = None
         self.events_log = deque(maxlen=EVENT_LOG_MAX_LINES)
-        self.simple_mode = False
         self.current_topic_path: list[str] | None = None
         self.root_topic: str | None = None
+        self.max_depth = 0
+        self.current_depth = 0
+        self._is_simple = get_tui_settings().mode == "simple"
+
+    # ---- Template methods for subclass customization ----
+
+    @abstractmethod
+    def _get_title(self) -> str:
+        """Return header title for this TUI."""
+        ...
+
+    @abstractmethod
+    def _get_subtitle(self, model_name: str) -> str:
+        """Return header subtitle for this TUI."""
+        ...
+
+    @abstractmethod
+    def _get_footer_description(self) -> str:
+        """Return footer progress description."""
+        ...
+
+    @abstractmethod
+    def _topic_model_type(self) -> str:
+        """Return 'tree' or 'graph' for context panel."""
+        ...
+
+    @abstractmethod
+    def _status_panel(self) -> Panel:
+        """Create status panel - must be implemented by subclass."""
+        ...
+
+    # ---- Lifecycle ----
 
     def start_building(self, model_name: str, depth: int, degree: int, root_topic: str) -> None:
-        """Start the tree building process."""
+        """Start the building process. Handles both simple and rich modes."""
         self.max_depth = depth
         self.root_topic = root_topic
 
-        # If simple/headless mode, print static header and return without Live
-        if get_tui_settings().mode == "simple":
-            header_panel = self.tui.create_header(
-                "DeepFabric Tree Generation",
-                f"Building hierarchical topic structure with {model_name}",
-            )
+        header_panel = self.tui.create_header(
+            self._get_title(),
+            self._get_subtitle(model_name),
+        )
+
+        # Simple/headless mode: print static header and return without Live
+        if self._is_simple:
             self.console.print(header_panel)
             self.console.print(f"Configuration: depth={depth}, degree={degree}")
             self.console.print()
-            self.simple_mode = True
             return
 
-        # Create simple progress display with indeterminate progress
+        # Rich mode: build full two-pane layout with footer
         self.progress = Progress(
             SpinnerColumn(),
             TextColumn(
@@ -347,17 +315,13 @@ class TreeBuildingTUI(TopicBuildingMixin, StreamObserver):
             TimeElapsedColumn(),
             console=self.console,
         )
-        # Two-pane layout: left header + progress + events; right status + preview
+
         layout = Layout(name="root")
         layout.split(Layout(name="main"), Layout(name="footer", size=3))
         left = Layout(name="left", ratio=3)
         right = Layout(name="right", ratio=2)
         right.minimum_size = STREAM_PANEL_WIDTH
 
-        header_panel = self.tui.create_header(
-            "DeepFabric Tree Generation",
-            f"Building hierarchical topic structure with {model_name}",
-        )
         stats = {"Model": model_name, "Depth": f"{depth}", "Degree": f"{degree}"}
         stats_table = self.tui.create_stats_table(stats)
         params_panel = Panel(stats_table, title="Generation Parameters", border_style="dim")
@@ -372,7 +336,7 @@ class TreeBuildingTUI(TopicBuildingMixin, StreamObserver):
         left["params"].update(params_panel)
         left["context"].update(self._context_panel())
         left["events"].update(self.tui.build_events_panel(list(self.events_log)))
-        # Right column: status + preview (preview fills remaining space)
+
         right.split(
             Layout(name="status", size=8),
             Layout(name="preview"),
@@ -381,59 +345,81 @@ class TreeBuildingTUI(TopicBuildingMixin, StreamObserver):
         right["status"].update(self._status_panel())
         right["preview"].update(self.tui.build_stream_panel("Waiting for generation..."))
 
-        # Start Live display with layout
         self.live_layout = layout
-        # Footer progress
+        footer_desc = self._get_footer_description()
         self.footer_progress = self.tui.create_footer(layout, title="Run Status")
-        self.footer_task = self.footer_progress.add_task("Building topic tree", total=depth)
+        self.footer_task = self.footer_progress.add_task(footer_desc, total=depth)
 
         self.live_display = Live(layout, console=self.console, refresh_per_second=15, screen=True)
         self.live_display.start()
-        self.overall_task = self.progress.add_task(f"Building topic tree (depth 1/{depth})")
+        self.overall_task = self.progress.add_task(f"{footer_desc} (depth 1/{depth})")
 
-    def start_depth_level(self, depth: int) -> None:
-        """Update progress for new depth level."""
-        self.current_depth = depth
-        if self.progress and self.overall_task is not None:
-            self.progress.update(
-                self.overall_task,
-                description=f"Building topic tree (depth {depth}/{self.max_depth})",
-            )
-        self.events_log.append(f"→ Depth {depth}/{self.max_depth} started")
+    def stop_live(self) -> None:
+        """Stop the Live display if it's running."""
+        if self.live_display:
+            self.live_display.stop()
+            self.live_display = None
+
+    # ---- Panel refresh helpers ----
+
+    def _refresh_left(self) -> None:
+        """Update events panel in left column."""
+        if self.live_layout is not None:
+            try:
+                self.live_layout["main"]["left"]["events"].update(
+                    self.tui.build_events_panel(list(self.events_log))
+                )
+            except Exception:
+                return
+
+    def update_status_panel(self) -> None:
+        """Update the status panel in the right column."""
+        if self.live_layout is None:
+            return
+        try:
+            self.live_layout["main"]["right"]["status"].update(self._status_panel())
+        except Exception:
+            return
+
+    def _context_panel(self) -> Panel:
+        return self.tui.build_context_panel(
+            root_topic=self.root_topic,
+            topic_model_type=self._topic_model_type(),
+            path=self.current_topic_path,
+        )
+
+    def _refresh_context(self) -> None:
+        if self.live_layout is not None:
+            try:
+                self.live_layout["main"]["left"]["context"].update(self._context_panel())
+            except Exception:
+                return
+
+    # ---- StreamObserver event handlers ----
+
+    def on_error(self, error: "ClassifiedError", metadata: dict[str, Any]) -> None:  # noqa: ARG002
+        """Handle error events - log to events panel."""
+        error_event = error.to_event()
+        self.events_log.append(f"X {error_event}")
         self._refresh_left()
-        # Advance footer on each depth start (only after first)
-        self.update_status_panel()
 
-    def start_subtree_generation(self, node_path: list[str], _num_subtopics: int) -> None:
-        """Log subtree generation without updating progress to avoid flicker."""
-        self.current_topic_path = node_path
-        self._refresh_context()
+        # In simple mode with --show-failures, print detailed error immediately
+        if self._is_simple and get_tui_settings().show_failures:
+            self.tui.console.print(f"[red]✗ FAILURE:[/red] {error_event}")
+            if error.message and error.message != error_event:
+                msg = error.message[:200] + "..." if len(error.message) > 200 else error.message
+                self.tui.console.print(f"  [dim]{msg}[/dim]")
+
+    def on_step_start(self, step_name: str, metadata: dict[str, Any]) -> None:  # noqa: ARG002
+        """Handle step start - topic building doesn't need specific handling."""
         pass
 
-    def complete_subtree_generation(self, success: bool, generated_count: int) -> None:
-        """Track completion without updating progress bar."""
-        if success:
-            self.generated_paths += generated_count
-        else:
-            self.failed_attempts += 1
-        # Log succinct outcome
-        status = "ok" if success else "fail"
-        self.events_log.append(f"✓ Subtree {status} (+{generated_count} paths)")
-        self._refresh_left()
-        self.update_status_panel()
-        # Advance footer on completed depth
-        with contextlib.suppress(Exception):
-            self.footer_progress.update(self.footer_task, advance=1)
-
-    def add_failure(self) -> None:
-        """Record a generation failure."""
-        self.failed_attempts += 1
-        self.events_log.append("✗ Generation failed")
-        self._refresh_left()
-        self.update_status_panel()
+    def on_step_complete(self, step_name: str, metadata: dict[str, Any]) -> None:  # noqa: ARG002
+        """Handle step complete - topic building doesn't need specific handling."""
+        pass
 
     def on_stream_chunk(self, _source: str, chunk: str, _metadata: dict[str, Any]) -> None:
-        """Handle streaming text from tree generation."""
+        """Handle streaming text from topic generation."""
         self.stream_buffer.append(chunk)
         if self.live_display and self.live_layout is not None:
             accumulated_text = "".join(self.stream_buffer)
@@ -478,7 +464,7 @@ class TreeBuildingTUI(TopicBuildingMixin, StreamObserver):
         error_summary: str,
         metadata: dict[str, Any],
     ) -> None:
-        """Handle retry events from the progress reporter by logging a concise message."""
+        """Handle retry events by logging a concise message."""
         _ = metadata  # Unused for now
         try:
             self.events_log.append(
@@ -489,19 +475,64 @@ class TreeBuildingTUI(TopicBuildingMixin, StreamObserver):
             # Swallow errors to avoid breaking progress reporting
             return
 
-    def _context_panel(self) -> Panel:
-        return self.tui.build_context_panel(
-            root_topic=self.root_topic,
-            topic_model_type="tree",
-            path=self.current_topic_path,
-        )
 
-    def _refresh_context(self) -> None:
-        if self.live_layout is not None:
-            try:
-                self.live_layout["main"]["left"]["context"].update(self._context_panel())
-            except Exception:
-                return
+class TreeBuildingTUI(TopicGenerationTUI):
+    """TUI for tree building operations."""
+
+    def __init__(self, tui: DeepFabricTUI):
+        super().__init__(tui)
+        self.generated_paths = 0
+
+    def _get_title(self) -> str:
+        return "DeepFabric Tree Generation"
+
+    def _get_subtitle(self, model_name: str) -> str:
+        return f"Building hierarchical topic structure with {model_name}"
+
+    def _get_footer_description(self) -> str:
+        return "Building topic tree"
+
+    def _topic_model_type(self) -> str:
+        return "tree"
+
+    def start_depth_level(self, depth: int) -> None:
+        """Update progress for new depth level."""
+        self.current_depth = depth
+        if self.progress and self.overall_task is not None:
+            self.progress.update(
+                self.overall_task,
+                description=f"Building topic tree (depth {depth}/{self.max_depth})",
+            )
+        self.events_log.append(f"→ Depth {depth}/{self.max_depth} started")
+        self._refresh_left()
+        self.update_status_panel()
+
+    def start_subtree_generation(self, node_path: list[str], _num_subtopics: int) -> None:
+        """Log subtree generation without updating progress to avoid flicker."""
+        self.current_topic_path = node_path
+        self._refresh_context()
+
+    def complete_subtree_generation(self, success: bool, generated_count: int) -> None:
+        """Track completion without updating progress bar."""
+        if success:
+            self.generated_paths += generated_count
+        else:
+            self.failed_attempts += 1
+        # Log succinct outcome
+        status = "ok" if success else "fail"
+        self.events_log.append(f"✓ Subtree {status} (+{generated_count} paths)")
+        self._refresh_left()
+        self.update_status_panel()
+        # Advance footer on completed depth
+        with contextlib.suppress(Exception):
+            self.footer_progress.update(self.footer_task, advance=1)
+
+    def add_failure(self) -> None:
+        """Record a generation failure."""
+        self.failed_attempts += 1
+        self.events_log.append("✗ Generation failed")
+        self._refresh_left()
+        self.update_status_panel()
 
     def finish_building(self, total_paths: int, failed_generations: int) -> None:
         """Finish the tree building process."""
@@ -531,100 +562,29 @@ class TreeBuildingTUI(TopicBuildingMixin, StreamObserver):
         return Panel(table, title="Status", border_style="dim", padding=(0, 1))
 
 
-class GraphBuildingTUI(TopicBuildingMixin, StreamObserver):
-    """TUI for graph building operations with simplified progress and streaming."""
+class GraphBuildingTUI(TopicGenerationTUI):
+    """TUI for graph building operations."""
 
     def __init__(self, tui: DeepFabricTUI):
-        self.tui = tui
-        self.console = tui.console
-        self.progress = None
-        self.overall_task = None
+        super().__init__(tui)
         self.nodes_count = 1  # Start with root
         self.edges_count = 0
-        self.failed_attempts = 0
-        self.stream_buffer = deque(maxlen=2000)
-        self.live_display = None
-        self.live_layout: Layout | None = None
-        self.events_log = deque(maxlen=EVENT_LOG_MAX_LINES)
-        self.simple_mode = False
-        self.current_topic_path: list[str] | None = None
-        self.root_topic: str | None = None
 
-    def start_building(self, model_name: str, depth: int, degree: int, root_topic: str) -> None:
-        """Start the graph building process."""
-        self.max_depth = depth
-        self.current_depth = 0
-        self.root_topic = root_topic
-        # If simple/headless mode, print static header and return
-        if get_tui_settings().mode == "simple":
-            header = self.tui.create_header(
-                "DeepFabric Graph Generation",
-                f"Building interconnected topic structure with {model_name}",
-            )
-            self.console.print(header)
-            self.console.print(f"Configuration: depth={depth}, degree={degree}")
-            self.console.print()
-            self.simple_mode = True
-            return
+    def _get_title(self) -> str:
+        return "DeepFabric Graph Generation"
 
-        # Create simple progress display
-        self.progress = Progress(
-            SpinnerColumn(),
-            TextColumn(
-                "[bold blue]{task.description}",
-                table_column=Column(ratio=1, overflow="ellipsis"),
-            ),
-            BarColumn(bar_width=None),
-            MofNCompleteColumn(),
-            TimeElapsedColumn(),
-            console=self.console,
-        )
-        # Two-pane layout: left header + events; right status + preview with footer at bottom
-        layout = Layout(name="root")
-        layout.split(Layout(name="main"), Layout(name="footer", size=3))
-        left = Layout(name="left", ratio=3)
-        right = Layout(name="right", ratio=2)
-        right.minimum_size = STREAM_PANEL_WIDTH
+    def _get_subtitle(self, model_name: str) -> str:
+        return f"Building interconnected topic structure with {model_name}"
 
-        header_panel = self.tui.create_header(
-            "DeepFabric Graph Generation",
-            f"Building interconnected topic structure with {model_name}",
-        )
-        stats = {"Model": model_name, "Depth": f"{depth}", "Degree": f"{degree}"}
-        stats_table = self.tui.create_stats_table(stats)
-        params_panel = Panel(stats_table, title="Generation Parameters", border_style="dim")
+    def _get_footer_description(self) -> str:
+        return "Building topic graph"
 
-        left.split(
-            Layout(name="header", size=4),
-            Layout(name="params", size=5),
-            Layout(name="context", size=5),
-            Layout(name="events"),
-        )
-        left["header"].update(header_panel)
-        left["params"].update(params_panel)
-        left["context"].update(self._context_panel())
-        left["events"].update(self.tui.build_events_panel(list(self.events_log)))
-        # Right column: status + preview (preview fills remaining space)
-        right.split(
-            Layout(name="status", size=8),
-            Layout(name="preview"),
-        )
-        layout["main"].split_row(left, right)
-        right["status"].update(self._status_panel())
-        right["preview"].update(self.tui.build_stream_panel("Waiting for generation..."))
-
-        # Footer progress
-        self.footer_progress = self.tui.create_footer(layout, title="Run Status")
-        self.footer_task = self.footer_progress.add_task("Building topic graph", total=depth)
-
-        self.live_layout = layout
-        self.live_display = Live(layout, console=self.console, refresh_per_second=15, screen=True)
-        self.live_display.start()
-        self.overall_task = self.progress.add_task("  Building topic graph", total=depth)
+    def _topic_model_type(self) -> str:
+        return "graph"
 
     def start_depth_level(self, depth: int, leaf_count: int) -> None:
         """Update for new depth level."""
-        if self.simple_mode:
+        if self._is_simple:
             self.console.print(f"  Depth {depth}: expanding {leaf_count} nodes...")
         elif self.progress and self.overall_task is not None:
             self.progress.update(
@@ -646,7 +606,7 @@ class GraphBuildingTUI(TopicBuildingMixin, StreamObserver):
 
     def complete_depth_level(self, depth: int) -> None:
         """Complete a depth level."""
-        if self.simple_mode:
+        if self._is_simple:
             self.console.print(
                 f"    Depth {depth} complete (nodes: {self.nodes_count}, edges: {self.edges_count})"
             )
@@ -662,7 +622,7 @@ class GraphBuildingTUI(TopicBuildingMixin, StreamObserver):
     def add_failure(self, node_topic: str) -> None:
         """Record a generation failure."""
         self.failed_attempts += 1
-        if self.simple_mode:
+        if self._is_simple:
             if len(node_topic) > EVENT_ERROR_MAX_LENGTH:
                 topic_display = node_topic[:EVENT_ERROR_MAX_LENGTH] + "..."
             else:
@@ -702,7 +662,7 @@ class GraphBuildingTUI(TopicBuildingMixin, StreamObserver):
                 error_display = error_summary
 
             # In simple mode, print directly to console
-            if self.simple_mode:
+            if self._is_simple:
                 self.console.print(
                     f"    [yellow]↻ Retry {attempt}/{max_attempts} '{topic_display}': {error_display}[/yellow]"
                 )
@@ -714,79 +674,6 @@ class GraphBuildingTUI(TopicBuildingMixin, StreamObserver):
         except Exception:
             # Best-effort, swallow errors to avoid breaking progress reporting
             return
-
-    def on_retry(
-        self,
-        sample_idx: int,
-        attempt: int,
-        max_attempts: int,
-        error_summary: str,
-        metadata: dict[str, Any],
-    ) -> None:
-        """Handle retry events from the progress reporter.
-
-        Provides a minimal implementation so GraphBuildingTUI is not abstract;
-        logs a concise retry message to the events panel.
-        """
-        _ = metadata  # Unused for now
-        try:
-            self.events_log.append(
-                f"↻ Retry sample {sample_idx} attempt {attempt}/{max_attempts}: {error_summary}"
-            )
-            self._refresh_left()
-        except Exception:
-            # Best-effort, swallow errors to avoid breaking progress reporting
-            return
-
-    def on_stream_chunk(self, _source: str, chunk: str, _metadata: dict[str, Any]) -> None:
-        """Handle streaming text from graph generation."""
-        self.stream_buffer.append(chunk)
-        if self.live_display and self.live_layout is not None:
-            accumulated_text = "".join(self.stream_buffer)
-            if len(accumulated_text) > STREAM_TEXT_MAX_LENGTH:
-                accumulated_text = "..." + accumulated_text[-STREAM_TEXT_MAX_LENGTH:]
-            display_text = accumulated_text.replace("\r", "")
-            display_text = re.sub(r"[^\S\n]+", " ", display_text)
-
-            # Compute dynamic preview lines based on terminal height
-            # Use TOPIC_PREVIEW_OFFSET for tree/graph TUIs (simpler layout)
-            terminal_height = self.console.size.height
-            target_lines = max(MIN_PREVIEW_LINES, terminal_height - TOPIC_PREVIEW_OFFSET)
-            lines = display_text.splitlines()
-
-            # Handle low-newline content (like JSON) to fill panel properly
-            if len(lines) >= int(target_lines / 2):
-                # Plenty of newlines: take the last N lines
-                visible_lines = lines[-target_lines:]
-            else:
-                # Low-newline content: take a character tail and then split
-                approx_right_cols = max(40, int(self.console.size.width * 0.42))
-                char_tail = max(800, approx_right_cols * max(8, target_lines - 2))
-                tail = display_text[-char_tail:]
-                visible_lines = tail.splitlines()[-target_lines:]
-
-            visible = "\n".join(visible_lines)
-
-            # Update the streaming panel
-            try:
-                container = self.live_layout["main"]["right"]["preview"]
-            except Exception:
-                container = self.live_layout["main"]["right"]
-            container.update(self.tui.build_stream_panel(visible))
-
-    def _context_panel(self) -> Panel:
-        return self.tui.build_context_panel(
-            root_topic=self.root_topic,
-            topic_model_type="graph",
-            path=self.current_topic_path,
-        )
-
-    def _refresh_context(self) -> None:
-        if self.live_layout is not None:
-            try:
-                self.live_layout["main"]["left"]["context"].update(self._context_panel())
-            except Exception:
-                return
 
     def finish_building(self, failed_generations: int) -> None:
         """Finish the graph building process."""
@@ -817,7 +704,7 @@ class GraphBuildingTUI(TopicBuildingMixin, StreamObserver):
         table = Table(show_header=False, box=None, padding=(0, 1))
         table.add_column(style="cyan", no_wrap=True)
         table.add_column(style="white")
-        table.add_row("Depth:", f"{self.current_depth}/{getattr(self, 'max_depth', 0)}")
+        table.add_row("Depth:", f"{self.current_depth}/{self.max_depth}")
         table.add_row("Nodes:", str(self.nodes_count))
         table.add_row("Edges:", str(self.edges_count))
         if self.failed_attempts:
@@ -863,6 +750,7 @@ class DatasetGenerationTUI(StreamObserver):
         self._resumed_from_checkpoint = False  # Set by set_checkpoint_resume_status()
         self._stop_requested = False  # Set when graceful stop requested via Ctrl+C
         self._is_cycle_based = False  # Set by init_status; controls "Cycle" vs "Step" labels
+        self._is_simple = get_tui_settings().mode != "rich"
         # Retry tracking for simple mode
         self.step_retries: list[dict] = []  # Retries in current step
 
@@ -1285,7 +1173,7 @@ class DatasetGenerationTUI(StreamObserver):
         self.log_event(f"X {error_event}")
 
         # In simple mode with --show-failures, print detailed error immediately
-        if get_tui_settings().mode != "rich" and get_tui_settings().show_failures:
+        if self._is_simple and get_tui_settings().show_failures:
             self.tui.console.print(f"[red]✗ FAILURE:[/red] {error_event}")
             if error.message and error.message != error_event:
                 # Show truncated full message if different from event
@@ -1317,7 +1205,7 @@ class DatasetGenerationTUI(StreamObserver):
         """
         _ = metadata  # Unused for now
 
-        if get_tui_settings().mode != "rich":
+        if self._is_simple:
             # Simple mode: track for summary at step completion
             self.step_retries.append(
                 {

@@ -1,6 +1,7 @@
 import asyncio
 import contextlib
 import json
+import math
 import os
 import traceback
 
@@ -20,6 +21,7 @@ from rich.progress import (
     TextColumn,
     TimeElapsedColumn,
 )
+from rich.table import Column
 
 from .config import DeepFabricConfig
 from .config_manager import DEFAULT_MODEL
@@ -103,6 +105,8 @@ async def handle_dataset_events_async(
     live = None
     simple_progress = None  # Progress bar for simple/headless mode
     simple_progress_task = None
+    simple_checkpoint_task = None  # Checkpoint progress task for simple mode
+    checkpoint_interval = 0
 
     final_result: HFDataset | None = None
     try:
@@ -198,14 +202,48 @@ async def handle_dataset_events_async(
                         prog_total = event["total_samples"]
                         resumed_samples = event.get("resumed_samples", 0)
 
-                        # Simple/headless mode: print header then show progress bar
-                        tui.show_generation_header(
-                            event["model_name"],
-                            display_steps,
-                            display_batch_size,
-                            total_samples=prog_total,
-                            is_cycle_based=is_cycle_based,
-                        )
+                        # Simple/headless mode: runtime summary then progress bar
+                        model_line = f"Model: {event['model_name']}"
+                        if event.get("topic_model_type"):
+                            topic_type = event["topic_model_type"]
+                            if is_cycle_based and event.get("unique_topics"):
+                                model_line += (
+                                    f" ({topic_type}, {event['unique_topics']} unique topics)"
+                                )
+                            else:
+                                model_line += f" ({topic_type})"
+                        tui.info(model_line)
+
+                        if is_cycle_based:
+                            output_line = (
+                                f"Output: num_samples={prog_total}, "
+                                f"concurrency={display_batch_size}"
+                            )
+                        else:
+                            output_line = (
+                                f"Output: num_samples={prog_total}, batch_size={display_batch_size}"
+                            )
+                        tui.info(output_line)
+
+                        if is_cycle_based:
+                            cycles = event.get("cycles_needed", 1)
+                            unique = event.get("unique_topics", 0)
+                            tui.info(
+                                f"  → Cycles needed: {cycles} "
+                                f"({prog_total} samples ÷ {unique} unique topics)"
+                            )
+                            final_cycle = event.get("final_cycle_size", 0)
+                            if final_cycle and unique and final_cycle < unique:
+                                tui.info(f"  → Final cycle: {final_cycle} topics (partial)")
+
+                        cp_interval = event.get("checkpoint_interval")
+                        if cp_interval and cp_interval > 0:
+                            total_cp = math.ceil(prog_total / cp_interval)
+                            tui.info(
+                                f"Checkpoint: every {cp_interval} samples "
+                                f"({total_cp} total checkpoints)"
+                            )
+
                         if resumed_samples >= prog_total:
                             # Checkpoint already has enough samples
                             tui.success(
@@ -217,7 +255,7 @@ async def handle_dataset_events_async(
                                 SpinnerColumn(),
                                 TextColumn("[progress.description]{task.description}"),
                                 BarColumn(),
-                                MofNCompleteColumn(),
+                                MofNCompleteColumn(table_column=Column(justify="right")),
                                 TimeElapsedColumn(),
                                 console=tui.console,
                             )
@@ -227,6 +265,14 @@ async def handle_dataset_events_async(
                                 completed=resumed_samples,
                             )
                             simple_progress.start()
+                            # Add checkpoint progress task if interval is set
+                            checkpoint_interval = event.get("checkpoint_interval") or 0
+                            if checkpoint_interval > 0:
+                                simple_checkpoint_task = simple_progress.add_task(
+                                    "Next checkpoint",
+                                    total=checkpoint_interval,
+                                    completed=0,
+                                )
                 elif event["event"] == "step_complete":
                     samples_generated = event.get("samples_generated", 0)
                     if footer_prog and task is not None:
@@ -241,6 +287,11 @@ async def handle_dataset_events_async(
                     elif simple_progress is not None and simple_progress_task is not None:
                         with contextlib.suppress(Exception):
                             simple_progress.update(simple_progress_task, advance=samples_generated)
+                        if simple_checkpoint_task is not None and samples_generated > 0:
+                            with contextlib.suppress(Exception):
+                                simple_progress.update(
+                                    simple_checkpoint_task, advance=samples_generated
+                                )
                         tui.clear_step_retries()
                 elif event["event"] == "step_start":
                     # Keep status panel in sync
@@ -266,6 +317,11 @@ async def handle_dataset_events_async(
                     elif simple_progress is not None and simple_progress_task is not None:
                         with contextlib.suppress(Exception):
                             simple_progress.update(simple_progress_task, advance=batch_generated)
+                        if simple_checkpoint_task is not None and batch_generated > 0:
+                            with contextlib.suppress(Exception):
+                                simple_progress.update(
+                                    simple_checkpoint_task, advance=batch_generated
+                                )
 
                 elif event["event"] == "cycle_complete":
                     # Cycle-based generation: log cycle summary (progress already advanced by batch_complete)
@@ -281,7 +337,6 @@ async def handle_dataset_events_async(
                 elif event["event"] == "checkpoint_saved":
                     # Display checkpoint save notification
                     total_samples = event.get("total_samples", 0)
-                    total_failures = event.get("total_failures", 0)
                     is_final = event.get("final", False)
 
                     if footer_prog and task is not None:
@@ -292,13 +347,12 @@ async def handle_dataset_events_async(
                             tui.log_event(f"💾 Checkpoint: {total_samples} samples")
                         tui.status_checkpoint_saved(total_samples)
                     elif simple_progress is not None:
-                        # Simple mode: print checkpoint notification above the bar
-                        checkpoint_msg = f"Checkpoint saved: {total_samples} samples"
-                        if total_failures > 0:
-                            checkpoint_msg += f" ({total_failures} failures)"
-                        if is_final:
-                            checkpoint_msg = "Final " + checkpoint_msg.lower()
-                        simple_progress.console.print(f"[dim]{checkpoint_msg}[/dim]")
+                        # Simple mode: reset checkpoint progress bar instead of stacking print lines
+                        if simple_checkpoint_task is not None and not is_final:
+                            with contextlib.suppress(Exception):
+                                simple_progress.reset(
+                                    simple_checkpoint_task, total=checkpoint_interval
+                                )
 
                 elif event["event"] == "generation_stopped":
                     # Graceful stop at checkpoint
@@ -456,19 +510,6 @@ async def create_dataset_async(
 
     generation_params = config.get_generation_params(**(generation_overrides or {}))
     final_model = model or generation_params.get("model_name", DEFAULT_MODEL)
-
-    import math  # noqa: PLC0415
-
-    # Show cycle-based info when topic_model has unique topics
-    unique_topics = topic_model.get_unique_topics()
-    unique_topic_count = len(unique_topics)
-    cycles_needed = math.ceil(final_num_samples / unique_topic_count) if unique_topic_count > 0 else 1
-
-    tui.info(f"Unique topics: {unique_topic_count}")
-    tui.info(
-        f"Dataset generation: {final_num_samples} samples in {cycles_needed} cycles "
-        f"(concurrency={final_batch_size})"
-    )
 
     # Still compute num_steps for backward compat with the generator's step-based path
     final_num_steps = math.ceil(final_num_samples / final_batch_size)

@@ -542,11 +542,19 @@ class DataSetGenerator:
                 "Please delete the checkpoint and restart: rm -rf .checkpoints/"
             )
         elif version > CHECKPOINT_VERSION:
-            error_msg = f"Checkpoint version {version} is newer than supported version {CHECKPOINT_VERSION}"
+            error_msg = (
+                f"Checkpoint version {version} is newer than supported version {CHECKPOINT_VERSION}"
+            )
 
         # Check required fields for v4 format
         if error_msg is None:
-            required_fields = ["created_at", "total_samples", "completed", "unique_topics", "cycles_needed"]
+            required_fields = [
+                "created_at",
+                "total_samples",
+                "completed",
+                "unique_topics",
+                "cycles_needed",
+            ]
             for field in required_fields:
                 if field not in metadata:
                     error_msg = f"Missing required field in checkpoint metadata: {field}"
@@ -1282,13 +1290,19 @@ class DataSetGenerator:
         total_samples = num_steps * batch_size
         data_creation_prompt = self._get_cot_prompt_template()
 
+        # Ensure checkpoint_interval is at least as large as batch_size/concurrency
+        # so checkpoints align with batch boundaries
+        if (
+            self.config.checkpoint_interval is not None
+            and self.config.checkpoint_interval < batch_size
+        ):
+            self.config.checkpoint_interval = batch_size
+
         final_result: HFDataset | dict | None = None
 
         # Use cycle-based generation when a topic model is provided
         if topic_model is not None:
-            unique_topics, cycles_needed = self._prepare_unique_topics(
-                total_samples, topic_model
-            )
+            unique_topics, cycles_needed = self._prepare_unique_topics(total_samples, topic_model)
 
             # batch_size becomes concurrency in the new model
             concurrency = batch_size
@@ -1361,6 +1375,14 @@ class DataSetGenerator:
         total_samples = num_steps * batch_size
         data_creation_prompt = self._get_cot_prompt_template()
 
+        # Ensure checkpoint_interval is at least as large as batch_size/concurrency
+        # so checkpoints align with batch boundaries
+        if (
+            self.config.checkpoint_interval is not None
+            and self.config.checkpoint_interval < batch_size
+        ):
+            self.config.checkpoint_interval = batch_size
+
         root_topic_prompt = None
         topic_model_type = None
         if topic_model is not None:
@@ -1369,9 +1391,7 @@ class DataSetGenerator:
 
         # Use cycle-based generation when a topic model is provided
         if topic_model is not None:
-            unique_topics, cycles_needed = self._prepare_unique_topics(
-                total_samples, topic_model
-            )
+            unique_topics, cycles_needed = self._prepare_unique_topics(total_samples, topic_model)
 
             # batch_size becomes concurrency in the new model
             concurrency = batch_size
@@ -1454,6 +1474,7 @@ class DataSetGenerator:
                 "resumed_samples": self._flushed_samples_count,
                 "resumed_failures": self._flushed_failures_count,
                 "checkpoint_enabled": self.config.checkpoint_interval is not None,
+                "checkpoint_interval": self.config.checkpoint_interval,
             }
 
             for step in range(num_steps):
@@ -1751,6 +1772,7 @@ class DataSetGenerator:
                 "resumed_samples": self._flushed_samples_count,
                 "resumed_failures": self._flushed_failures_count,
                 "checkpoint_enabled": self.config.checkpoint_interval is not None,
+                "checkpoint_interval": self.config.checkpoint_interval,
             }
 
             for cycle in range(cycles_needed):
@@ -1837,9 +1859,7 @@ class DataSetGenerator:
                     # Create concurrent tasks
                     # Pass current samples_generated as starting index for each task
                     tasks = [
-                        asyncio.create_task(
-                            process_topic(topic, cycle, samples_generated + i)
-                        )
+                        asyncio.create_task(process_topic(topic, cycle, samples_generated + i))
                         for i, topic in enumerate(batch_topics)
                     ]
 

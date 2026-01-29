@@ -2,6 +2,7 @@ import contextlib
 import json
 import math
 import os
+import select
 import signal
 import sys
 
@@ -419,6 +420,31 @@ def _trigger_cloud_upload(
     )
 
 
+def _prompt_with_timeout(
+    choices: list[str],
+    default: str,
+    timeout: int = 20,
+) -> str:
+    """Prompt for a choice with a visible countdown, auto-selecting default on timeout."""
+    valid = set(choices)
+    for remaining in range(timeout, 0, -1):
+        sys.stdout.write(f"\r  Choose [{'/'.join(choices)}] (auto-{default} in {remaining:2d}s): ")
+        sys.stdout.flush()
+        ready, _, _ = select.select([sys.stdin], [], [], 1.0)
+        if ready:
+            line = sys.stdin.readline().strip()
+            sys.stdout.write("\n")
+            sys.stdout.flush()
+            if line in valid:
+                return line
+            if line == "":
+                return default
+            return default
+    sys.stdout.write("\n")
+    sys.stdout.flush()
+    return default
+
+
 def _run_generation(
     *,
     preparation: GenerationPreparation,
@@ -470,14 +496,10 @@ def _run_generation(
         tui.console.print("  [cyan]3)[/cyan] Abort")
         tui.console.print()
 
-        choice = click.prompt(
-            "Choose an option",
-            type=click.Choice(["1", "2", "3"]),
-            default="1",
-        )
+        choice = _prompt_with_timeout(["1", "2", "3"], default="1", timeout=20)
 
         if choice == "1":
-            # User wants to resume
+            # User wants to resume (or auto-selected after timeout)
             options.resume = True
         elif choice == "2":
             # Clear and start fresh
@@ -783,7 +805,9 @@ def generate(  # noqa: PLR0913
 
         # Compute checkpoint directory once for consistent use throughout generation
         # Use config file for hash, fallback to output path for config-less runs
-        path_source = options.config_file or options.output_save_as or preparation.config.output.save_as
+        path_source = (
+            options.config_file or options.output_save_as or preparation.config.output.save_as
+        )
         checkpoint_dir = options.checkpoint_path or get_checkpoint_dir(path_source)
 
         # Auto-infer topics-load when resuming from checkpoint
