@@ -258,6 +258,8 @@ class TopicGenerationTUI(StreamObserver):
         self.max_depth = 0
         self.current_depth = 0
         self._is_simple = get_tui_settings().mode == "simple"
+        self.simple_progress: Progress | None = None
+        self.simple_task = None
 
     # ---- Template methods for subclass customization ----
 
@@ -286,6 +288,11 @@ class TopicGenerationTUI(StreamObserver):
         """Create status panel - must be implemented by subclass."""
         ...
 
+    @abstractmethod
+    def _get_simple_total(self, depth: int, degree: int) -> int:
+        """Return the total for the simple mode progress bar."""
+        ...
+
     # ---- Lifecycle ----
 
     def start_building(self, model_name: str, depth: int, degree: int, root_topic: str) -> None:
@@ -298,11 +305,25 @@ class TopicGenerationTUI(StreamObserver):
             self._get_subtitle(model_name),
         )
 
-        # Simple/headless mode: print static header and return without Live
+        # Simple/headless mode: print config summary, optional progress bar, no Live
         if self._is_simple:
-            self.console.print(header_panel)
-            self.console.print(f"Configuration: depth={depth}, degree={degree}")
+            self.console.print(f"Model: {model_name}")
+            self.console.print(f"Topic configuration: depth={depth}, degree={degree}")
             self.console.print()
+            total = self._get_simple_total(depth, degree)
+            if self.console.is_terminal:
+                self.simple_progress = Progress(
+                    SpinnerColumn(),
+                    TextColumn("[progress.description]{task.description}"),
+                    BarColumn(),
+                    MofNCompleteColumn(table_column=Column(justify="right")),
+                    TimeElapsedColumn(),
+                    console=self.console,
+                )
+                self.simple_task = self.simple_progress.add_task(
+                    self._get_footer_description(), total=total
+                )
+                self.simple_progress.start()
             return
 
         # Rich mode: build full two-pane layout with footer
@@ -360,6 +381,23 @@ class TopicGenerationTUI(StreamObserver):
         if self.live_display:
             self.live_display.stop()
             self.live_display = None
+
+    def advance_simple_progress(self, advance: int = 1, description: str = "") -> None:
+        """Advance the simple mode progress bar."""
+        if self.simple_progress is not None and self.simple_task is not None:
+            with contextlib.suppress(Exception):
+                if description:
+                    self.simple_progress.update(
+                        self.simple_task, advance=advance, description=description
+                    )
+                else:
+                    self.simple_progress.update(self.simple_task, advance=advance)
+
+    def stop_simple_progress(self) -> None:
+        """Stop the simple mode progress bar."""
+        if self.simple_progress is not None:
+            self.simple_progress.stop()
+            self.simple_progress = None
 
     # ---- Panel refresh helpers ----
 
@@ -496,6 +534,11 @@ class TreeBuildingTUI(TopicGenerationTUI):
     def _topic_model_type(self) -> str:
         return "tree"
 
+    def _get_simple_total(self, depth: int, degree: int) -> int:
+        if degree <= 1:
+            return depth
+        return (degree**depth - 1) // (degree - 1)
+
     def start_depth_level(self, depth: int) -> None:
         """Update progress for new depth level."""
         self.current_depth = depth
@@ -531,6 +574,7 @@ class TreeBuildingTUI(TopicGenerationTUI):
     def add_failure(self) -> None:
         """Record a generation failure."""
         self.failed_attempts += 1
+        self.advance_simple_progress()
         self.events_log.append("✗ Generation failed")
         self._refresh_left()
         self.update_status_panel()
@@ -539,6 +583,7 @@ class TreeBuildingTUI(TopicGenerationTUI):
         """Finish the tree building process."""
         if self.live_display:
             self.live_display.stop()
+        self.stop_simple_progress()
 
         # Final summary
         self.console.print()
@@ -583,10 +628,17 @@ class GraphBuildingTUI(TopicGenerationTUI):
     def _topic_model_type(self) -> str:
         return "graph"
 
+    def _get_simple_total(self, depth: int, degree: int) -> int:
+        return depth
+
     def start_depth_level(self, depth: int, leaf_count: int) -> None:
         """Update for new depth level."""
         if self._is_simple:
-            self.console.print(f"  Depth {depth}: expanding {leaf_count} nodes...")
+            desc = f"Depth {depth}/{self.max_depth} ({leaf_count} nodes)"
+            if self.simple_progress is not None:
+                self.advance_simple_progress(advance=0, description=desc)
+            else:
+                self.console.print(f"  Depth {depth}: expanding {leaf_count} nodes...")
         elif self.progress and self.overall_task is not None:
             self.progress.update(
                 self.overall_task,
@@ -608,9 +660,12 @@ class GraphBuildingTUI(TopicGenerationTUI):
     def complete_depth_level(self, depth: int) -> None:
         """Complete a depth level."""
         if self._is_simple:
-            self.console.print(
-                f"    Depth {depth} complete (nodes: {self.nodes_count}, edges: {self.edges_count})"
-            )
+            if self.simple_progress is not None:
+                self.advance_simple_progress()
+            else:
+                self.console.print(
+                    f"  Depth {depth} complete (nodes: {self.nodes_count}, edges: {self.edges_count})"
+                )
         elif self.progress and self.overall_task is not None:
             self.progress.advance(self.overall_task, 1)
         self.events_log.append(f"✓ Depth {depth} complete")
@@ -680,6 +735,7 @@ class GraphBuildingTUI(TopicGenerationTUI):
         """Finish the graph building process."""
         if self.live_display:
             self.live_display.stop()
+        self.stop_simple_progress()
 
         # Show final stats
         self.console.print()

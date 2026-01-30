@@ -129,6 +129,8 @@ async def _process_tree_events(tree: Tree, debug: bool = False) -> dict | None:
                     tui.add_failure()
                     if debug and "error" in event:
                         get_tui().error(f"Debug: Tree generation failure - {event['error']}")
+                else:
+                    tui.advance_simple_progress()
             elif event["event"] == "build_complete":
                 total_paths = (
                     int(event["total_paths"]) if isinstance(event["total_paths"], str | int) else 0
