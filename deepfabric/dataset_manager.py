@@ -274,6 +274,7 @@ async def handle_dataset_events_async(
                                 completed=resumed_samples,
                             )
                             simple_progress.start()
+                            tui.simple_progress = simple_progress
                             # Add checkpoint progress task if interval is set
                             checkpoint_interval = event.get("checkpoint_interval") or 0
                             if checkpoint_interval > 0:
@@ -402,6 +403,7 @@ async def handle_dataset_events_async(
                         live.stop()
                     if simple_progress is not None:
                         simple_progress.stop()
+                        tui.simple_progress = None
                     tui.console.print()
                     tui.success(
                         f"Gracefully stopped: {event['total_samples']} samples saved to checkpoint"
@@ -415,6 +417,7 @@ async def handle_dataset_events_async(
                         live.stop()
                     if simple_progress is not None:
                         simple_progress.stop()
+                        tui.simple_progress = None
                     tui.console.print()  # Add blank line after live display
                     tui.success(f"Successfully generated {event['total_samples']} samples")
 
@@ -461,6 +464,7 @@ async def handle_dataset_events_async(
             live.stop()
         if simple_progress is not None:
             simple_progress.stop()
+            tui.simple_progress = None
         if debug:
             get_tui().error(f"🔍 Debug: Full traceback:\n{traceback.format_exc()}")
         get_tui().error(f"Dataset generation failed: {str(e)}")
@@ -560,8 +564,10 @@ async def create_dataset_async(
     progress_reporter = ProgressReporter()
     progress_reporter.attach(tui)
 
-    # Attach progress reporter to engine
+    # Attach progress reporter to engine and its LLM retry handler
     engine.progress_reporter = progress_reporter
+    if hasattr(engine, "llm_client"):
+        engine.llm_client.retry_handler.progress_reporter = progress_reporter
 
     try:
         generator = engine.create_data_with_events_async(

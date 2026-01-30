@@ -45,6 +45,8 @@ async def _process_graph_events(graph: Graph, debug: bool = False) -> dict | Non
     progress_reporter = ProgressReporter()
     progress_reporter.attach(tui)
     graph.progress_reporter = progress_reporter
+    if hasattr(graph, "llm_client"):
+        graph.llm_client.retry_handler.progress_reporter = progress_reporter
 
     tui_started = False
 
@@ -116,6 +118,8 @@ async def _process_tree_events(tree: Tree, debug: bool = False) -> dict | None:
     progress_reporter = ProgressReporter()
     progress_reporter.attach(tui)
     tree.progress_reporter = progress_reporter
+    if hasattr(tree, "llm_client"):
+        tree.llm_client.retry_handler.progress_reporter = progress_reporter
 
     final_event = None
     try:

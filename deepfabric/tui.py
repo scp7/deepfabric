@@ -307,8 +307,8 @@ class TopicGenerationTUI(StreamObserver):
 
         # Simple/headless mode: print config summary, optional progress bar, no Live
         if self._is_simple:
-            self.console.print(f"Model: {model_name}")
-            self.console.print(f"Topic configuration: depth={depth}, degree={degree}")
+            self.tui.info(f"Model: {model_name}")
+            self.tui.info(f"Topic configuration: depth={depth}, degree={degree}")
             self.console.print()
             total = self._get_simple_total(depth, degree)
             if self.console.is_terminal:
@@ -398,6 +398,13 @@ class TopicGenerationTUI(StreamObserver):
         if self.simple_progress is not None:
             self.simple_progress.stop()
             self.simple_progress = None
+
+    def _simple_print(self, message: str) -> None:
+        """Print a message in simple mode, routing through the progress bar if active."""
+        if self.simple_progress is not None:
+            self.simple_progress.console.print(message)
+        else:
+            self.console.print(message)
 
     # ---- Panel refresh helpers ----
 
@@ -514,6 +521,26 @@ class TopicGenerationTUI(StreamObserver):
             # Swallow errors to avoid breaking progress reporting
             return
 
+    def on_llm_retry(
+        self,
+        provider: str,
+        attempt: int,
+        wait: float,
+        error_summary: str,
+        metadata: dict[str, Any],
+    ) -> None:
+        """Handle LLM API retry events (rate limits, transient errors)."""
+        _ = metadata
+        try:
+            short_msg = f"↻ {provider} retry (attempt {attempt}), backoff {wait:.1f}s"
+            self.events_log.append(short_msg)
+            self._refresh_left()
+
+            if self._is_simple:
+                self._simple_print(f"    [yellow]{short_msg}: {error_summary}[/yellow]")
+        except Exception:
+            return
+
 
 class TreeBuildingTUI(TopicGenerationTUI):
     """TUI for tree building operations."""
@@ -588,11 +615,9 @@ class TreeBuildingTUI(TopicGenerationTUI):
         # Final summary
         self.console.print()
         if failed_generations > 0:
-            self.tui.warning(f"Tree building complete with {failed_generations} failures")
+            self.tui.warning(f"Created {total_paths} unique topics ({failed_generations} failed)")
         else:
-            self.tui.success("Tree building completed successfully")
-
-        self.tui.info(f"Generated {total_paths} total paths")
+            self.tui.success(f"Created {total_paths} unique topics")
         self.events_log.append("✓ Tree building completed")
         self.update_status_panel()
 
@@ -683,7 +708,7 @@ class GraphBuildingTUI(TopicGenerationTUI):
                 topic_display = node_topic[:EVENT_ERROR_MAX_LENGTH] + "..."
             else:
                 topic_display = node_topic
-            self.console.print(f"    [red]✗ Node expansion failed: {topic_display}[/red]")
+            self._simple_print(f"    [red]✗ Node expansion failed: {topic_display}[/red]")
         self.events_log.append("✗ Node expansion failed")
         self._refresh_left()
 
@@ -717,9 +742,9 @@ class GraphBuildingTUI(TopicGenerationTUI):
             else:
                 error_display = error_summary
 
-            # In simple mode, print directly to console
+            # In simple mode, print through progress-aware helper
             if self._is_simple:
-                self.console.print(
+                self._simple_print(
                     f"    [yellow]↻ Retry {attempt}/{max_attempts} '{topic_display}': {error_display}[/yellow]"
                 )
 
@@ -737,22 +762,29 @@ class GraphBuildingTUI(TopicGenerationTUI):
             self.live_display.stop()
         self.stop_simple_progress()
 
-        # Show final stats
         self.console.print()
-        stats_table = self.tui.create_stats_table(
-            {
-                "Total Nodes": self.nodes_count,
-                "Total Edges": self.edges_count,
-                "Failed Attempts": self.failed_attempts,
-            }
-        )
-        self.console.print(Panel(stats_table, title="Final Statistics", border_style="dim"))
-
-        # Final summary
-        if failed_generations > 0:
-            self.tui.warning(f"Graph building complete with {failed_generations} failures")
+        if self._is_simple:
+            # One-liner summary for simple/headless mode
+            if failed_generations > 0:
+                self.tui.warning(
+                    f"Created {self.nodes_count} unique topics ({failed_generations} failed)"
+                )
+            else:
+                self.tui.success(f"Created {self.nodes_count} unique topics")
         else:
-            self.tui.success("Graph building completed successfully")
+            # Rich mode: show detailed stats panel
+            stats_table = self.tui.create_stats_table(
+                {
+                    "Total Nodes": self.nodes_count,
+                    "Total Edges": self.edges_count,
+                    "Failed Attempts": self.failed_attempts,
+                }
+            )
+            self.console.print(Panel(stats_table, title="Final Statistics", border_style="dim"))
+            if failed_generations > 0:
+                self.tui.warning(f"Graph building complete with {failed_generations} failures")
+            else:
+                self.tui.success("Graph building completed successfully")
         self.events_log.append("✓ Graph building completed")
         self.update_status_panel()
 
@@ -808,6 +840,7 @@ class DatasetGenerationTUI(StreamObserver):
         self._stop_requested = False  # Set when graceful stop requested via Ctrl+C
         self._is_cycle_based = False  # Set by init_status; controls "Cycle" vs "Step" labels
         self._is_simple = get_tui_settings().mode != "rich"
+        self.simple_progress: Progress | None = None  # Set by dataset_manager for simple mode
         # Retry tracking for simple mode
         self.step_retries: list[dict] = []  # Retries in current step
 
@@ -1310,6 +1343,31 @@ class DatasetGenerationTUI(StreamObserver):
         if len(samples_with_retries) == 1:
             return f"{total_retries} retry for sample {list(samples_with_retries)[0]}"
         return f"{total_retries} retries across {len(samples_with_retries)} samples"
+
+    def on_llm_retry(
+        self,
+        provider: str,
+        attempt: int,
+        wait: float,
+        error_summary: str,
+        metadata: dict[str, Any],
+    ) -> None:
+        """Handle LLM API retry events (rate limits, transient errors)."""
+        _ = metadata
+        try:
+            short_msg = f"↻ {provider} retry (attempt {attempt}), backoff {wait:.1f}s"
+            self.events_log.append(short_msg)
+            self._refresh_left()
+
+            if self._is_simple:
+                if self.simple_progress is not None:
+                    self.simple_progress.console.print(
+                        f"    [yellow]{short_msg}: {error_summary}[/yellow]"
+                    )
+                else:
+                    self.console.print(f"    [yellow]{short_msg}: {error_summary}[/yellow]")
+        except Exception:
+            return
 
 
 # Global TUI instances
