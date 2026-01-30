@@ -48,6 +48,7 @@ TOPIC_PREVIEW_OFFSET = 13
 # Truncation limits for event log display
 EVENT_TOPIC_MAX_LENGTH = 20  # Max chars for topic names in events
 EVENT_ERROR_MAX_LENGTH = 80  # Max chars for error summaries in events
+ERROR_MESSAGE_MAX_LENGTH = 200  # Max chars for detailed error messages in simple mode
 
 
 @dataclass
@@ -453,7 +454,7 @@ class TopicGenerationTUI(StreamObserver):
         if self._is_simple and get_tui_settings().show_failures:
             self.tui.console.print(f"[red]✗ FAILURE:[/red] {error_event}")
             if error.message and error.message != error_event:
-                msg = error.message[:200] + "..." if len(error.message) > 200 else error.message
+                msg = error.message[:ERROR_MESSAGE_MAX_LENGTH] + "..." if len(error.message) > ERROR_MESSAGE_MAX_LENGTH else error.message
                 self.tui.console.print(f"  [dim]{msg}[/dim]")
 
     def on_step_start(self, step_name: str, metadata: dict[str, Any]) -> None:  # noqa: ARG002
@@ -653,7 +654,7 @@ class GraphBuildingTUI(TopicGenerationTUI):
     def _topic_model_type(self) -> str:
         return "graph"
 
-    def _get_simple_total(self, depth: int, degree: int) -> int:
+    def _get_simple_total(self, depth: int, degree: int) -> int:  # noqa: ARG002
         return depth
 
     def start_depth_level(self, depth: int, leaf_count: int) -> None:
@@ -1284,7 +1285,7 @@ class DatasetGenerationTUI(StreamObserver):
             self.tui.console.print(f"[red]✗ FAILURE:[/red] {error_event}")
             if error.message and error.message != error_event:
                 # Show truncated full message if different from event
-                msg = error.message[:200] + "..." if len(error.message) > 200 else error.message
+                msg = error.message[:ERROR_MESSAGE_MAX_LENGTH] + "..." if len(error.message) > ERROR_MESSAGE_MAX_LENGTH else error.message
                 self.tui.console.print(f"  [dim]{msg}[/dim]")
 
     def on_retry(

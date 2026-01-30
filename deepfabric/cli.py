@@ -1342,12 +1342,10 @@ def validate(config_file: str, check_api: bool) -> None:  # noqa: PLR0912
             )
             if is_partial:
                 tui.info(f"  → Final cycle: {final_cycle_size} topics (partial)")
+        elif num_samples == "auto":
+            tui.info(f"  → Will generate 1 sample per unique topic ({estimated_paths} samples)")
         else:
-            # For 'auto' or percentage, explain what will happen
-            if num_samples == "auto":
-                tui.info(f"  → Will generate 1 sample per unique topic ({estimated_paths} samples)")
-            else:
-                tui.info(f"  → Samples calculated at runtime based on topic count")
+            tui.info("  → Samples calculated at runtime based on topic count")
 
         if config.huggingface:
             hf_config = config.get_huggingface_config()
