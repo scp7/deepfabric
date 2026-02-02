@@ -1,7 +1,6 @@
 import asyncio
 import json
 import time
-import uuid as uuid_module
 import warnings
 
 from typing import TYPE_CHECKING, Any, TypedDict
@@ -176,7 +175,6 @@ class Tree(TopicModel):
         # Derived attributes
         self.system_prompt = self.config.topic_system_prompt
         self.tree_paths: list[list[str]] = []
-        self._leaf_uuids: list[str] = []  # UUIDs for each path, parallel to tree_paths
         self.failed_generations: list[dict[str, Any]] = []
 
     async def build_async(self, model_name: str | None = None):
@@ -244,43 +242,41 @@ class Tree(TopicModel):
         """Returns all the paths in the topic model."""
         return self.tree_paths
 
-    def _add_path(self, path: list[str], leaf_uuid: str | None = None) -> None:
-        """Add a path with its UUID.
+    @staticmethod
+    def _path_to_id(path: list[str]) -> str:
+        """Compute a deterministic topic ID from a tree path."""
+        return "/".join(path)
+
+    def _add_path(self, path: list[str]) -> None:
+        """Add a path to the tree.
 
         Args:
-            path: The topic path to add
-            leaf_uuid: Optional UUID for the leaf. If None, generates a new one.
+            path: The topic path to add.
         """
         self.tree_paths.append(path)
-        self._leaf_uuids.append(leaf_uuid or str(uuid_module.uuid4()))
 
     def get_all_paths_with_ids(self) -> list[TopicPath]:
         """Returns all paths with their unique identifiers.
 
         Returns:
             List of TopicPath namedtuples containing (path, topic_id).
-            The topic_id is the persisted UUID for each leaf.
+            The topic_id is computed deterministically from the path content.
         """
-        result: list[TopicPath] = []
-        for path, leaf_uuid in zip(self.tree_paths, self._leaf_uuids, strict=True):
-            result.append(TopicPath(path=path, topic_id=leaf_uuid))
-        return result
+        return [TopicPath(path=path, topic_id=self._path_to_id(path)) for path in self.tree_paths]
 
     def get_unique_topics(self) -> list[Topic]:
-        """Returns deduplicated topics by UUID.
+        """Returns all leaf topics with computed IDs.
 
-        For Trees, each path has a unique leaf UUID, so this returns
-        all leaf topics with their UUIDs.
+        For Trees, each path is unique by definition, so this returns
+        all leaf topics with deterministic path-based IDs.
 
         Returns:
             List of Topic namedtuples containing (uuid, topic).
         """
-        result: list[Topic] = []
-        for path, leaf_uuid in zip(self.tree_paths, self._leaf_uuids, strict=True):
-            # The topic is the last element in the path (the leaf)
-            leaf_topic = path[-1] if path else ""
-            result.append(Topic(uuid=leaf_uuid, topic=leaf_topic))
-        return result
+        return [
+            Topic(uuid=self._path_to_id(path), topic=path[-1] if path else "")
+            for path in self.tree_paths
+        ]
 
     async def get_subtopics(
         self, system_prompt: str, node_path: list[str], num_subtopics: int
@@ -426,15 +422,15 @@ class Tree(TopicModel):
     def save(self, save_path: str) -> None:
         """Save the topic tree to a file.
 
-        Each path is saved with its leaf UUID for stable identification.
-        Format: {"path": [...], "leaf_uuid": "..."}
+        Format: {"path": [...]}
+        IDs are computed on-the-fly from path content, not persisted.
         """
         from pathlib import Path  # noqa: PLC0415
 
         Path(save_path).parent.mkdir(parents=True, exist_ok=True)
         with open(save_path, "w") as f:
-            for path, leaf_uuid in zip(self.tree_paths, self._leaf_uuids, strict=True):
-                f.write(json.dumps({"path": path, "leaf_uuid": leaf_uuid}) + "\n")
+            for path in self.tree_paths:
+                f.write(json.dumps({"path": path}) + "\n")
 
         # Save failed generations if any
         if self.failed_generations:
@@ -457,7 +453,6 @@ class Tree(TopicModel):
         """
         return {
             "tree_paths": self.tree_paths,
-            "leaf_uuids": self._leaf_uuids,
             "failed_generations": self.failed_generations,
             "config": {
                 "topic_prompt": self.topic_prompt,
@@ -472,26 +467,18 @@ class Tree(TopicModel):
     def from_dict_list(self, dict_list: list[dict[str, Any]]) -> None:
         """Construct the topic tree from a list of dictionaries.
 
-        Args:
-            dict_list (list[dict]): The list of dictionaries representing the topic tree.
-                Each path entry must have 'path' and 'leaf_uuid' fields.
+        Accepts both the current format (``{"path": [...]}``) and the
+        legacy format that included a ``leaf_uuid`` field (silently ignored).
 
-        Raises:
-            TreeError: If any path entry is missing the required 'leaf_uuid' field.
+        Args:
+            dict_list: The list of dictionaries representing the topic tree.
         """
         # Clear existing data
         self.tree_paths = []
-        self._leaf_uuids = []
         self.failed_generations = []
 
         for d in dict_list:
             if "path" in d:
-                if "leaf_uuid" not in d:
-                    raise TreeError(
-                        "Tree format outdated: missing 'leaf_uuid' field. "
-                        "Please rebuild your topic tree with: deepfabric generate --topic-only <config>"
-                    )
                 self.tree_paths.append(d["path"])
-                self._leaf_uuids.append(d["leaf_uuid"])
             elif "failed_generation" in d:
                 self.failed_generations.append(d["failed_generation"])
