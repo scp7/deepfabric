@@ -455,7 +455,11 @@ class TopicGenerationTUI(StreamObserver):
         if self._is_simple and get_tui_settings().show_failures:
             self.tui.console.print(f"[red]✗ FAILURE:[/red] {error_event}")
             if error.message and error.message != error_event:
-                msg = error.message[:ERROR_MESSAGE_MAX_LENGTH] + "..." if len(error.message) > ERROR_MESSAGE_MAX_LENGTH else error.message
+                msg = (
+                    error.message[:ERROR_MESSAGE_MAX_LENGTH] + "..."
+                    if len(error.message) > ERROR_MESSAGE_MAX_LENGTH
+                    else error.message
+                )
                 self.tui.console.print(f"  [dim]{msg}[/dim]")
 
     def on_step_start(self, step_name: str, metadata: dict[str, Any]) -> None:  # noqa: ARG002
@@ -1170,7 +1174,9 @@ class DatasetGenerationTUI(StreamObserver):
             if self.checkpoint_enabled:
                 table.add_row("[yellow]Stopping:[/yellow]", "[yellow]at next checkpoint[/yellow]")
             else:
-                table.add_row("[yellow]Stopping:[/yellow]", "[yellow]saving partial results[/yellow]")
+                table.add_row(
+                    "[yellow]Stopping:[/yellow]", "[yellow]saving partial results[/yellow]"
+                )
         return Panel(table, title="Status", border_style="dim", padding=(0, 1))
 
     def update_status_panel(self) -> None:
@@ -1289,7 +1295,11 @@ class DatasetGenerationTUI(StreamObserver):
             self.tui.console.print(f"[red]✗ FAILURE:[/red] {error_event}")
             if error.message and error.message != error_event:
                 # Show truncated full message if different from event
-                msg = error.message[:ERROR_MESSAGE_MAX_LENGTH] + "..." if len(error.message) > ERROR_MESSAGE_MAX_LENGTH else error.message
+                msg = (
+                    error.message[:ERROR_MESSAGE_MAX_LENGTH] + "..."
+                    if len(error.message) > ERROR_MESSAGE_MAX_LENGTH
+                    else error.message
+                )
                 self.tui.console.print(f"  [dim]{msg}[/dim]")
 
     def on_retry(

@@ -553,7 +553,9 @@ def _run_generation(
             if has_checkpoint:
                 tui.warning("Stopping after current checkpoint... (Ctrl+C again to force quit)")
             else:
-                tui.warning("Stopping... partial results will be saved. (Ctrl+C again to force quit)")
+                tui.warning(
+                    "Stopping... partial results will be saved. (Ctrl+C again to force quit)"
+                )
             dataset_tui = get_dataset_tui()
             dataset_tui.log_event("⚠ Graceful stop requested")
             dataset_tui.status_stop_requested()
@@ -692,7 +694,7 @@ def _run_generation(
     "--cloud-upload",
     type=click.Choice(["all", "dataset", "graph", "none"], case_sensitive=False),
     default=None,
-    help="Upload to DeepFabric Cloud (experimental): all, dataset, graph, or none. "
+    help="Upload to DeepFabric Cloud (experimental): all, dataset, graph, or none. ",
 )
 @click.option(
     "--checkpoint-interval",

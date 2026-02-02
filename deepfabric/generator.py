@@ -665,9 +665,7 @@ class DataSetGenerator:
                             if "topic_id" in failure:
                                 failed_ids.add(failure["topic_id"])
                                 if "cycle" in failure:
-                                    failed_tuples.add(
-                                        (failure["topic_id"], failure["cycle"])
-                                    )
+                                    failed_tuples.add((failure["topic_id"], failure["cycle"]))
                 self._flushed_failures_count = failure_count
 
             # If retry_failed is True, remove failed entries from completed set
@@ -679,9 +677,7 @@ class DataSetGenerator:
                 else:
                     # Legacy fallback: no cycle info, remove all cycles for failed UUIDs
                     tuples_to_remove = {
-                        (uuid, cycle)
-                        for uuid, cycle in self._completed
-                        if uuid in failed_ids
+                        (uuid, cycle) for uuid, cycle in self._completed if uuid in failed_ids
                     }
                 self._completed -= tuples_to_remove
                 # Clear failures file since we're retrying
